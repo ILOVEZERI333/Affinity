@@ -1,2 +1,2 @@
 # Affinity
-A distributed task schedular using Raft consensus and consistent hashing to track manhwa/manga/manhua releases and guarantee Discord webhook delivery.
+A distributed task schedular and event dispatcher built using Go. Its primary use case is monitor romance update schedules and broadcasting this through real time Discord webhooks, the underlying architecture deals with complex distributed system problems. It features a Raft consensus implementation, consistent hashing for workload sharding and and a decoupled message queue for reliable webhook delivery. 
