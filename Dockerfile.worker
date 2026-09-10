@@ -1,0 +1,11 @@
+# Dockerfile.worker
+# TODO: Multi-stage build for the distributed worker binary.
+FROM golang:1.22-alpine AS builder
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 go build -o /worker ./cmd/worker
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=builder /worker /worker
+USER nonroot:nonroot
+ENTRYPOINT ["/worker"]

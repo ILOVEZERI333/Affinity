@@ -1,0 +1,11 @@
+# Dockerfile.operator
+# TODO: Multi-stage build for the Kubernetes operator binary.
+FROM golang:1.22-alpine AS builder
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 go build -o /operator ./cmd/operator
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=builder /operator /operator
+USER nonroot:nonroot
+ENTRYPOINT ["/operator"]

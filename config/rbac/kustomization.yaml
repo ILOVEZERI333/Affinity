@@ -1,0 +1,2 @@
+# Placeholder for RBAC (Role, ClusterRole, bindings, ServiceAccount).
+# TODO: Populate via Kubebuilder scaffolding.
