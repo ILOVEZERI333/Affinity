@@ -40,7 +40,7 @@ func loadConfig() Config {
 		NodeID:       getenv("NODE_ID", os.Getenv("POD_NAME")),
 		BindAddr:     getenv("BIND_ADDR", ":7946"),
 		PeerAddrs:    peers,
-		Bootstrap:    os.Getenv("BOOTSTRAP") == "true",
+		Bootstrap:    bootstrapFromEnv(),
 		DataDir:      getenv("DATA_DIR", "/data/raft"),
 		SyncInterval: interval,
 		WebhookURL:   os.Getenv("WEBHOOK_URL"),
@@ -52,6 +52,20 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// bootstrapFromEnv honors BOOTSTRAP when set; otherwise ordinal-0 pods bootstrap
+// (StatefulSet pod names end with "-0").
+func bootstrapFromEnv() bool {
+	switch os.Getenv("BOOTSTRAP") {
+	case "true":
+		return true
+	case "false":
+		return false
+	default:
+		podName := getenv("NODE_ID", os.Getenv("POD_NAME"))
+		return strings.HasSuffix(podName, "-0")
+	}
 }
 
 func main() {

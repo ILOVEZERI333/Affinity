@@ -112,7 +112,7 @@ detected → delivery_pending (Raft outbox) → POST → delivered | retry_if_st
 
 ---
 
-## Phase 3 — Control Plane: Operator Reconcile 🔲 Next
+## Phase 3 — Control Plane: Operator Reconcile ✅ Complete
 
 **Goal:** `kubectl apply` CR → operator creates ConfigMap + headless Service + StatefulSet → Status updates.
 
@@ -164,7 +164,7 @@ Workers read this in Phase 4; Phase 3 only creates the object.
 | `POD_NAME` | Downward API `metadata.name` | pod name |
 | `NODE_ID` | same as `POD_NAME` | — |
 | `BIND_ADDR` | literal | `:7946` |
-| `BOOTSTRAP` | `"true"` if pod ordinal == 0, else `"false"` | — |
+| `BOOTSTRAP` | optional — worker defaults ordinal **0** from pod name suffix `-0` | — |
 | `DATA_DIR` | literal | `/data/raft` |
 | `SYNC_INTERVAL` | `spec.syncInterval` | `30s` |
 | `WEBHOOK_URL` | `spec.webhookDestination` | — |
@@ -368,7 +368,7 @@ Skip Discord polish and multi-source parsers until week 3's path works with a st
 | --- | --- |
 | 1 — Boundaries and Guarantees | ✅ Complete |
 | 2 — API: Desired vs Observed | ✅ Complete |
-| 3 — Control Plane: Operator Reconcile | 🔲 Next (blueprint below) |
+| 3 — Control Plane: Operator Reconcile | ✅ Complete |
 | 4 — Worker Identity and Bootstrap | 🔲 |
 | 5 — Cluster Membership (Raft) | 🔲 |
 | 6 — Work Placement (Hash Ring) | 🔲 |
