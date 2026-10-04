@@ -209,7 +209,7 @@ kubectl get sts,svc,cm -l app.kubernetes.io/instance=manhwa-tracker
 **Do not start Raft until** you can draw: YAML applied → what Kubernetes objects exist.
 ---
 
-## Phase 4 — Worker Identity and Bootstrap
+## Phase 4 — Worker Identity and Bootstrap ✅ Complete
 
 **Decide:**
 
@@ -219,9 +219,28 @@ kubectl get sts,svc,cm -l app.kubernetes.io/instance=manhwa-tracker
 
 **Invariant:** A node's identity must survive pod restart on the same ordinal (PVC for Raft `DataDir`).
 
-**Repo:** `RaftNodeConfig`, env in `cmd/worker/main.go`
+### What's wired now
 
-**Learning check:** Why StatefulSet and not Deployment for workers?
+| Piece | Where | Behavior |
+| --- | --- | --- |
+| Stable node ID | `cmd/worker/main.go` `loadConfig()` | `NODE_ID` = `POD_NAME` (downward API) — same ordinal reconnects as the same Raft ID after a restart. |
+| Bootstrap ordinal | `cmd/worker/main.go` `bootstrapFromEnv()` | Pod name ending `-0` bootstraps unless `BOOTSTRAP` env overrides it. |
+| Raft identity survives restart | `internal/controller/resources.go` `desiredStatefulSet` | `raft-data` is now a **PVC** (`VolumeClaimTemplates`, 1Gi, `ReadWriteOnce`) bound per ordinal, not `emptyDir` — a rescheduled `workers-N` pod reattaches to its own Raft log/stable store instead of starting empty. |
+| Peer discovery | `internal/controller/resources.go` `peerAddresses` → `PEER_ADDRS` env | Operator computes every ordinal's headless-Service DNS name (`{sts}-{i}.{sts}.{ns}.svc.cluster.local:7946`) and joins them with commas; each worker gets the full set and is responsible for skipping its own address. |
+
+**Still a stub (Phase 5):** actually dialing `PEER_ADDRS` and calling `Join` — `cmd/worker/main.go` leaves this as a `TODO` keyed off `raftNode.IsLeader()` becoming meaningful once `internal/worker/raft.go` has a real `raft.Raft` behind it. Phase 4 only guarantees identity is stable and peers are discoverable; cluster membership mechanics are Phase 5.
+
+**Proof of done:**
+
+```bash
+go test ./internal/controller/...
+# TestDesiredStatefulSetPeerAddrsAndRaftPVC asserts PEER_ADDRS lists every
+# ordinal's DNS name and raft-data is a PVC template, not emptyDir.
+```
+
+**Repo:** `RaftNodeConfig`, env in `cmd/worker/main.go`; `peerAddresses`/`desiredStatefulSet` in `internal/controller/resources.go`
+
+**Learning check:** Why StatefulSet and not Deployment for workers? Because identity (stable ordinal → stable DNS name → stable Raft `NODE_ID` → stable PVC) is the whole point: a Deployment's pods are fungible and get a new name (and a fresh PVC, under `volumeClaimTemplates` semantics) on every reschedule, which would make every restart look like a brand-new Raft peer joining instead of the same voter rejoining with its log intact.
 
 ---
 
@@ -369,7 +388,7 @@ Skip Discord polish and multi-source parsers until week 3's path works with a st
 | 1 — Boundaries and Guarantees | ✅ Complete |
 | 2 — API: Desired vs Observed | ✅ Complete |
 | 3 — Control Plane: Operator Reconcile | ✅ Complete |
-| 4 — Worker Identity and Bootstrap | 🔲 |
+| 4 — Worker Identity and Bootstrap | ✅ Complete |
 | 5 — Cluster Membership (Raft) | 🔲 |
 | 6 — Work Placement (Hash Ring) | 🔲 |
 | 7 — Execution (Scrape Loop) | 🔲 |

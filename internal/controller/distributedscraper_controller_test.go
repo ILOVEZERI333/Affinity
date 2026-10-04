@@ -56,6 +56,38 @@ func TestDesiredStatefulSetReplicasAndNaming(t *testing.T) {
 	}
 }
 
+func TestDesiredStatefulSetPeerAddrsAndRaftPVC(t *testing.T) {
+	scraper := &infrav1.DistributedScraper{
+		ObjectMeta: metav1.ObjectMeta{Name: "manhwa-tracker", Namespace: "default"},
+		Spec: infrav1.DistributedScraperSpec{
+			WorkerNodes: 3,
+		},
+	}
+	sts := desiredStatefulSet(scraper)
+
+	var peerAddrs string
+	for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "PEER_ADDRS" {
+			peerAddrs = e.Value
+		}
+	}
+	want := "manhwa-tracker-workers-0.manhwa-tracker-workers.default.svc.cluster.local:7946," +
+		"manhwa-tracker-workers-1.manhwa-tracker-workers.default.svc.cluster.local:7946," +
+		"manhwa-tracker-workers-2.manhwa-tracker-workers.default.svc.cluster.local:7946"
+	if peerAddrs != want {
+		t.Fatalf("PEER_ADDRS: got %q want %q", peerAddrs, want)
+	}
+
+	if len(sts.Spec.VolumeClaimTemplates) != 1 || sts.Spec.VolumeClaimTemplates[0].Name != raftDataVolumeName {
+		t.Fatalf("expected a %q PVC template, got %+v", raftDataVolumeName, sts.Spec.VolumeClaimTemplates)
+	}
+
+	mounts := sts.Spec.Template.Spec.Containers[0].VolumeMounts
+	if len(mounts) != 1 || mounts[0].Name != raftDataVolumeName || mounts[0].MountPath != raftDataMountPath {
+		t.Fatalf("unexpected volume mounts: %+v", mounts)
+	}
+}
+
 func TestDesiredServiceHeadless(t *testing.T) {
 	scraper := &infrav1.DistributedScraper{
 		ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "default"},

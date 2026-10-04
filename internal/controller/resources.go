@@ -1,10 +1,12 @@
 package controller
 
 import (
+	"fmt"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -16,7 +18,9 @@ const (
 	workerContainerName = "worker"
 	workerImage         = "distriscrape-worker:latest"
 	workerPort          = 7946
+	raftDataVolumeName  = "raft-data"
 	raftDataMountPath   = "/data/raft"
+	raftDataStorageSize = "1Gi"
 	targetsConfigKey    = "targets.yaml"
 	defaultSyncInterval = "30s"
 
@@ -36,6 +40,19 @@ func configMapName(scraper *infrav1.DistributedScraper) string {
 
 func workersResourceName(scraper *infrav1.DistributedScraper) string {
 	return scraper.Name + "-workers"
+}
+
+// peerAddresses returns the stable DNS address of every worker ordinal,
+// resolvable via the headless Service once pods are scheduled. Each worker
+// gets the full set (including itself) and is responsible for skipping its
+// own address when joining the Raft cluster.
+func peerAddresses(scraper *infrav1.DistributedScraper) []string {
+	svc := workersResourceName(scraper)
+	addrs := make([]string, 0, scraper.Spec.WorkerNodes)
+	for i := int32(0); i < scraper.Spec.WorkerNodes; i++ {
+		addrs = append(addrs, fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:%d", svc, i, svc, scraper.Namespace, workerPort))
+	}
+	return addrs
 }
 
 func desiredConfigMap(scraper *infrav1.DistributedScraper) *corev1.ConfigMap {
@@ -125,20 +142,32 @@ func desiredStatefulSet(scraper *infrav1.DistributedScraper) *appsv1.StatefulSet
 								{Name: "DATA_DIR", Value: raftDataMountPath},
 								{Name: "SYNC_INTERVAL", Value: syncInterval},
 								{Name: "WEBHOOK_URL", Value: scraper.Spec.WebhookDestination},
+								{Name: "PEER_ADDRS", Value: strings.Join(peerAddresses(scraper), ",")},
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
-									Name:      "raft-data",
+									Name:      raftDataVolumeName,
 									MountPath: raftDataMountPath,
 								},
 							},
 						},
 					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "raft-data",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+			// PVC per ordinal so a restarted pod on the same ordinal reattaches
+			// to its own Raft log/stable store instead of starting from empty
+			// state (identity surviving restart is the Phase 4 invariant).
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   raftDataVolumeName,
+						Labels: podLabels,
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse(raftDataStorageSize),
 							},
 						},
 					},
