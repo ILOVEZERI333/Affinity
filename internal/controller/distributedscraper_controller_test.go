@@ -96,7 +96,7 @@ func TestDesiredServiceHeadless(t *testing.T) {
 	if svc.Spec.ClusterIP != "None" {
 		t.Fatalf("expected headless service, clusterIP=%q", svc.Spec.ClusterIP)
 	}
-	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != workerPort {
+	if len(svc.Spec.Ports) != 2 || svc.Spec.Ports[0].Port != workerPort || svc.Spec.Ports[1].Port != workerAPIPort {
 		t.Fatalf("unexpected ports: %+v", svc.Spec.Ports)
 	}
 }

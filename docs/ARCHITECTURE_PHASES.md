@@ -244,7 +244,7 @@ go test ./internal/controller/...
 
 ---
 
-## Phase 5 — Cluster Membership (Raft)
+## Phase 5 — Cluster Membership (Raft) ✅ Complete
 
 **Think before hash ring:**
 
@@ -256,7 +256,37 @@ Raft answers: **who is in the cluster, who is leader, what config is authoritati
 
 **Failure to design for:** Split brain — two nodes both think they're leader. Raft's term/leader check is the fencing foundation.
 
-**Repo:** `internal/worker/raft.go`
+### What's wired now
+
+| Piece | Where | Behavior |
+| --- | --- | --- |
+| Raft node | `internal/worker/raft.go` `NewRaftNode` | `hashicorp/raft` over TCP on `:7946`, BoltDB log/stable store + file snapshots under `DATA_DIR` (the PVC). Config stores each node's **advertised DNS name**, not its pod IP, via a custom stream layer. |
+| Bootstrap | `NewRaftNode` | Ordinal 0 bootstraps a one-voter cluster **only if `DATA_DIR` has no Raft state**, so a restart never re-bootstraps. |
+| Join | `internal/worker/server.go` `JoinCluster` / `/join` | Nodes with no known leader POST to peers' API port (Raft port + 1 = `7947`); followers answer `421` with the leader's address and the client follows it. Leader calls `AddVoter`. Idempotent. |
+| Ring members = voters | `RaftNode.Voters()` | Membership lives in Raft's own configuration. |
+| Ring epoch | `ringFSM` | Replicated counter, `+1` on every real membership change (join of a new voter, removal). Survives restart via snapshots. |
+| Dead-voter removal | `RaftNode.monitorDeadVoters` | Leader watches `FailedHeartbeatObservation`; a voter silent for `DEAD_VOTER_TIMEOUT` (default 5s) is removed via `RemoveServer`, which bumps the epoch. |
+| Rejoin | `cmd/worker/main.go` `maintainMembership` | A node with no leader (new, or evicted while down) re-runs `JoinCluster` every 3s. |
+| Operator | `internal/controller/resources.go` | Headless Service exposes `api` (7947) and sets `publishNotReadyAddresses` so pods resolve each other before Ready. |
+
+**Tuning:** `DEAD_VOTER_TIMEOUT` trades eviction speed against churn. It must exceed a typical pod restart or rolling restarts will evict and re-add every pod; it must stay well under the 10s failover SLO.
+
+**Known limits:**
+
+- Losing a majority at once leaves the cluster unable to elect or evict; it recovers when enough pods return with their PVCs.
+- An ordinal-0 pod whose PVC is lost while the cluster is alive would bootstrap a separate cluster. Don't delete PVCs casually.
+- Only the epoch is replicated so far. Target assignments and the outbox arrive in Phases 6–7; the epoch is not yet enforced anywhere.
+
+**Proof of done:**
+
+```bash
+go test ./internal/worker/...
+# TestClusterFormationFailoverAndDeadVoterRemoval: 3 nodes form via join,
+# the leader is killed, a new leader is elected and evicts it (epoch bumps),
+# and the old node restarts on its data dir and rejoins.
+```
+
+**Repo:** `internal/worker/raft.go`, `internal/worker/server.go`, `cmd/worker/main.go`
 
 **Order rule:** Membership stable → then placement. Not the reverse.
 
@@ -389,7 +419,7 @@ Skip Discord polish and multi-source parsers until week 3's path works with a st
 | 2 — API: Desired vs Observed | ✅ Complete |
 | 3 — Control Plane: Operator Reconcile | ✅ Complete |
 | 4 — Worker Identity and Bootstrap | ✅ Complete |
-| 5 — Cluster Membership (Raft) | 🔲 |
+| 5 — Cluster Membership (Raft) | ✅ Complete |
 | 6 — Work Placement (Hash Ring) | 🔲 |
 | 7 — Execution (Scrape Loop) | 🔲 |
 | 8 — Delivery and Idempotency | 🔲 |

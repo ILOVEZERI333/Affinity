@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,13 +17,16 @@ import (
 // Config is read from the environment. The operator sets these on the
 // worker StatefulSet's pod template from the DistributedScraper spec.
 type Config struct {
-	NodeID       string // usually the pod name (ordinal-stable via StatefulSet)
-	BindAddr     string // this node's peer RPC address
-	PeerAddrs    []string
-	Bootstrap    bool // true for pod ordinal 0 only
-	DataDir      string
-	SyncInterval time.Duration
-	WebhookURL   string
+	NodeID           string // usually the pod name (ordinal-stable via StatefulSet)
+	BindAddr         string // Raft transport listen address
+	AdvertiseAddr    string // stable address peers use to reach this node's Raft transport
+	APIBindAddr      string // peer API (join/handoff) listen address
+	PeerAddrs        []string
+	Bootstrap        bool // true for pod ordinal 0 only
+	DataDir          string
+	SyncInterval     time.Duration
+	DeadVoterTimeout time.Duration
+	WebhookURL       string
 }
 
 func loadConfig() Config {
@@ -31,20 +35,48 @@ func loadConfig() Config {
 		log.Fatalf("invalid SYNC_INTERVAL: %v", err)
 	}
 
+	deadVoterTimeout, err := time.ParseDuration(getenv("DEAD_VOTER_TIMEOUT", worker.DefaultDeadVoterTimeout.String()))
+	if err != nil {
+		log.Fatalf("invalid DEAD_VOTER_TIMEOUT: %v", err)
+	}
+
 	var peers []string
 	if raw := os.Getenv("PEER_ADDRS"); raw != "" {
 		peers = strings.Split(raw, ",")
 	}
 
+	nodeID := getenv("NODE_ID", os.Getenv("POD_NAME"))
+	bindAddr := getenv("BIND_ADDR", ":7946")
+
 	return Config{
-		NodeID:       getenv("NODE_ID", os.Getenv("POD_NAME")),
-		BindAddr:     getenv("BIND_ADDR", ":7946"),
-		PeerAddrs:    peers,
-		Bootstrap:    bootstrapFromEnv(),
-		DataDir:      getenv("DATA_DIR", "/data/raft"),
-		SyncInterval: interval,
-		WebhookURL:   os.Getenv("WEBHOOK_URL"),
+		NodeID:           nodeID,
+		BindAddr:         bindAddr,
+		AdvertiseAddr:    getenv("ADVERTISE_ADDR", advertiseAddrFor(nodeID, bindAddr, peers)),
+		APIBindAddr:      getenv("API_BIND_ADDR", ":7947"),
+		PeerAddrs:        peers,
+		Bootstrap:        bootstrapFromEnv(),
+		DataDir:          getenv("DATA_DIR", "/data/raft"),
+		SyncInterval:     interval,
+		DeadVoterTimeout: deadVoterTimeout,
+		WebhookURL:       os.Getenv("WEBHOOK_URL"),
 	}
+}
+
+// advertiseAddrFor finds this node's own entry in PEER_ADDRS (the operator
+// builds each as "{pod}.{svc}.{ns}.svc.cluster.local:{port}"), which is its
+// stable headless-Service DNS name. Outside Kubernetes there is no such
+// entry, so fall back to localhost on the bind port.
+func advertiseAddrFor(nodeID, bindAddr string, peers []string) string {
+	for _, p := range peers {
+		if strings.HasPrefix(p, nodeID+".") {
+			return p
+		}
+	}
+	_, port, err := net.SplitHostPort(bindAddr)
+	if err != nil {
+		return bindAddr
+	}
+	return net.JoinHostPort("localhost", port)
 }
 
 func getenv(key, fallback string) string {
@@ -68,6 +100,30 @@ func bootstrapFromEnv() bool {
 	}
 }
 
+// maintainMembership keeps this node in the cluster. A node with no known
+// leader is either brand new or was evicted as a dead voter while it was down,
+// so it asks the cluster to (re)add it. Joining is idempotent. The leader
+// never needs to join: it already is the cluster.
+func maintainMembership(ctx context.Context, n *worker.RaftNode, cfg Config) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if n.IsLeader() || n.LeaderAddr() != "" {
+			continue
+		}
+		if err := worker.JoinCluster(ctx, cfg.PeerAddrs, cfg.NodeID, cfg.AdvertiseAddr); err != nil {
+			log.Printf("join cluster: %v", err)
+			continue
+		}
+		log.Printf("joined cluster as %s", cfg.NodeID)
+	}
+}
+
 func main() {
 	cfg := loadConfig()
 	if cfg.NodeID == "" {
@@ -78,25 +134,31 @@ func main() {
 	defer cancel()
 
 	raftNode, err := worker.NewRaftNode(worker.RaftNodeConfig{
-		NodeID:    cfg.NodeID,
-		BindAddr:  cfg.BindAddr,
-		DataDir:   cfg.DataDir,
-		Bootstrap: cfg.Bootstrap,
+		NodeID:           cfg.NodeID,
+		BindAddr:         cfg.BindAddr,
+		AdvertiseAddr:    cfg.AdvertiseAddr,
+		DataDir:          cfg.DataDir,
+		Bootstrap:        cfg.Bootstrap,
+		DeadVoterTimeout: cfg.DeadVoterTimeout,
 	})
 	if err != nil {
 		log.Fatalf("failed to start raft node: %v", err)
 	}
+	defer func() {
+		if err := raftNode.Shutdown(); err != nil {
+			log.Printf("raft shutdown: %v", err)
+		}
+	}()
 
 	ring := worker.NewHashRing(64)
 	ring.AddNode(cfg.NodeID)
 
-	peerServer := worker.NewServer(cfg.BindAddr, raftNode, ring)
+	peerServer := worker.NewServer(cfg.APIBindAddr, raftNode, ring)
 	engine := scraper.NewEngine(cfg.WebhookURL)
 
-	// TODO: once raftNode.IsLeader() is meaningful, only the leader should
-	// place cfg.PeerAddrs on the ring and call peerServer.Join for each; on
-	// followers, wait for TaskHandoff RPCs to populate engine.SetTargets.
-	_ = cfg.PeerAddrs
+	// TODO (Phase 6): the leader places Raft voters on the ring and pushes
+	// assignments; followers wait for TaskHandoff RPCs to populate
+	// engine.SetTargets.
 
 	go func() {
 		if err := peerServer.ListenAndServe(ctx); err != nil {
@@ -105,6 +167,7 @@ func main() {
 	}()
 
 	go engine.Run(ctx, cfg.SyncInterval)
+	go maintainMembership(ctx, raftNode, cfg)
 
 	log.Printf("worker %s ready (bind=%s)", cfg.NodeID, cfg.BindAddr)
 	<-ctx.Done()

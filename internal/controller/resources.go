@@ -18,6 +18,7 @@ const (
 	workerContainerName = "worker"
 	workerImage         = "distriscrape-worker:latest"
 	workerPort          = 7946
+	workerAPIPort       = 7947 // peer API (join/handoff); Raft's port + 1
 	raftDataVolumeName  = "raft-data"
 	raftDataMountPath   = "/data/raft"
 	raftDataStorageSize = "1Gi"
@@ -79,11 +80,20 @@ func desiredService(scraper *infrav1.DistributedScraper) *corev1.Service {
 		Spec: corev1.ServiceSpec{
 			ClusterIP: "None",
 			Selector:  labelsFor(scraper),
+			// Pods must resolve each other (and themselves) before they are
+			// Ready: Raft can't form a cluster until peers can dial each other.
+			PublishNotReadyAddresses: true,
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "peer",
 					Port:       workerPort,
 					TargetPort: intstr.FromInt32(workerPort),
+					Protocol:   corev1.ProtocolTCP,
+				},
+				{
+					Name:       "api",
+					Port:       workerAPIPort,
+					TargetPort: intstr.FromInt32(workerAPIPort),
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},
