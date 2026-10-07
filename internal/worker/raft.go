@@ -15,6 +15,8 @@ import (
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+
+	"github.com/affinity/distriscrape/internal/scraper"
 )
 
 const (
@@ -32,6 +34,12 @@ const (
 	deadVoterCheckInterval = time.Second
 
 	cmdBumpEpoch = "bump_epoch"
+
+	// Outbox commands (Phase 8). They carry the writer's ring epoch and are
+	// fenced against the replicated one inside the FSM.
+	cmdOutboxBaseline = "outbox_baseline"
+	cmdOutboxEnqueue  = "outbox_enqueue"
+	cmdOutboxAck      = "outbox_ack"
 )
 
 // ErrNotLeader is returned by operations that only the Raft leader can
@@ -110,7 +118,7 @@ func NewRaftNode(cfg RaftNodeConfig) (*RaftNode, error) {
 		return nil, fmt.Errorf("raft: open snapshot store: %w", err)
 	}
 
-	fsm := &ringFSM{}
+	fsm := &ringFSM{outbox: scraper.NewOutboxState()}
 	r, err := raft.NewRaft(rc, fsm, logStore, logStore, snapshots, trans)
 	if err != nil {
 		_ = logStore.Close()
@@ -318,14 +326,27 @@ func (n *RaftNode) LeaderCh(ctx context.Context) <-chan bool {
 // Apply proposes a command (e.g. "target X moved to node Y") to the
 // replicated log. Only meaningful when IsLeader() is true.
 func (n *RaftNode) Apply(cmd []byte, timeout time.Duration) error {
+	_, err := n.apply(cmd, timeout)
+	return err
+}
+
+// apply proposes cmd and returns what the FSM's Apply returned for it, or the
+// FSM's error. ErrNotLeader means the entry was never appended. Losing
+// leadership mid-replication is NOT mapped to it: the entry may still commit
+// under the next leader, so the caller must not assume it was not applied.
+func (n *RaftNode) apply(cmd []byte, timeout time.Duration) (any, error) {
 	f := n.raft.Apply(cmd, timeout)
 	if err := f.Error(); err != nil {
-		return err
+		if errors.Is(err, raft.ErrNotLeader) {
+			return nil, ErrNotLeader
+		}
+		return nil, err
 	}
-	if err, ok := f.Response().(error); ok {
-		return err
+	resp := f.Response()
+	if err, ok := resp.(error); ok {
+		return nil, err
 	}
-	return nil
+	return resp, nil
 }
 
 func (n *RaftNode) servers() ([]raft.Server, error) {
@@ -432,17 +453,27 @@ func (a stringAddr) String() string  { return string(a) }
 // command is the envelope for entries in the replicated log.
 type command struct {
 	Type string `json:"type"`
+
+	// Outbox commands only. Epoch is the ring epoch the writing worker last
+	// accepted a handoff at; the FSM rejects the command if the replicated epoch
+	// has moved past it.
+	Target string `json:"target,omitempty"`
+	Number string `json:"number,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Title  string `json:"title,omitempty"`
+	Epoch  uint64 `json:"epoch,omitempty"`
 }
 
 // ringFSM applies committed log entries to local in-memory state on every
-// node, including followers. Phase 5 replicates only the ring epoch; the
-// membership itself lives in Raft's own configuration. Phase 6 adds target
-// assignments (and mutates ring) here.
+// node, including followers. It replicates the ring epoch (membership itself
+// lives in Raft's own configuration) and, since Phase 8, the delivery outbox:
+// pending notifications plus each target's high-water mark.
 type ringFSM struct {
 	ring *HashRing
 
-	mu    sync.RWMutex
-	epoch uint64
+	mu     sync.RWMutex
+	epoch  uint64
+	outbox *scraper.OutboxState
 }
 
 var _ raft.FSM = (*ringFSM)(nil)
@@ -467,14 +498,64 @@ func (f *ringFSM) Apply(l *raft.Log) interface{} {
 		defer f.mu.Unlock()
 		f.epoch++
 		return f.epoch
+	case cmdOutboxBaseline, cmdOutboxEnqueue, cmdOutboxAck:
+		return f.applyOutbox(cmd)
 	default:
 		return fmt.Errorf("unknown command type %q", cmd.Type)
 	}
 }
 
+// applyOutbox applies an outbox command, first fencing it: a writer whose ring
+// epoch is behind the replicated one has been evicted or has missed a rebalance
+// and may no longer own the target, so it cannot record or acknowledge a
+// delivery. The check runs in the FSM, so every node reaches the same verdict
+// for the same log position.
+//
+// One exception: acknowledging a chapter that is already pending is accepted
+// from a stale writer. The webhook did fire, so the ack only records a fact, and
+// rejecting it would make every rebalance that lands between POST and Ack
+// announce the chapter twice. A stale writer still cannot enqueue, baseline, or
+// ack something that was never pending.
+func (f *ringFSM) applyOutbox(cmd command) any {
+	f.mu.RLock()
+	stale := cmd.Epoch < f.epoch
+	f.mu.RUnlock()
+	if stale && !(cmd.Type == cmdOutboxAck && f.outbox.IsPending(cmd.Target, cmd.Number)) {
+		return ErrStaleEpoch
+	}
+	ch := scraper.Chapter{Target: cmd.Target, Number: cmd.Number, URL: cmd.URL, Title: cmd.Title}
+	switch cmd.Type {
+	case cmdOutboxBaseline:
+		n, err := scraper.ParseChapterNumber(cmd.Number)
+		if err != nil {
+			return fmt.Errorf("baseline: %w", err)
+		}
+		f.outbox.Baseline(cmd.Target, n)
+		return scraper.StateDelivered
+	case cmdOutboxEnqueue:
+		st, err := f.outbox.Enqueue(ch)
+		if err != nil {
+			return err
+		}
+		return st
+	default: // cmdOutboxAck
+		if err := f.outbox.Ack(ch); err != nil {
+			return err
+		}
+		return scraper.StateDelivered
+	}
+}
+
+// HighWater returns the replicated high-water mark for target as applied on
+// this node.
+func (f *ringFSM) HighWater(target string) (float64, bool) {
+	return f.outbox.HighWater(target)
+}
+
 // fsmState is the serialized form of the FSM used for snapshots.
 type fsmState struct {
-	Epoch uint64 `json:"epoch"`
+	Epoch  uint64                  `json:"epoch"`
+	Outbox scraper.OutboxSnapshot `json:"outbox"`
 }
 
 // Snapshot returns an FSMSnapshot used to: support log compaction, so a
@@ -483,7 +564,7 @@ type fsmState struct {
 func (f *ringFSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return &fsmSnapshot{state: fsmState{Epoch: f.epoch}}, nil
+	return &fsmSnapshot{state: fsmState{Epoch: f.epoch, Outbox: f.outbox.Snapshot()}}, nil
 }
 
 // Restore is used to restore an FSM from a snapshot, e.g. on node restart.
@@ -496,6 +577,7 @@ func (f *ringFSM) Restore(snapshot io.ReadCloser) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.epoch = state.Epoch
+	f.outbox.Restore(state.Outbox)
 	return nil
 }
 

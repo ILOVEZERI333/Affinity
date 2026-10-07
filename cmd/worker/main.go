@@ -161,6 +161,10 @@ func main() {
 	peerServer := worker.NewServer(cfg.APIBindAddr, raftNode, ring)
 	engine := scraper.NewEngine(cfg.WebhookURL)
 	engine.SourceURL = cfg.SourceURL
+	// Delivery state (pending notifications and high-water marks) is replicated
+	// through Raft, so it follows a target when the ring moves it and survives
+	// this node dying. Writes are fenced by the epoch of our latest handoff.
+	engine.Outbox = worker.NewOutboxClient(raftNode, peerServer.Epoch)
 
 	// Accepted handoffs replace the engine's target set. Every node does this;
 	// only the leader runs the placer that sends them.

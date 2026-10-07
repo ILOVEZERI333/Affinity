@@ -69,6 +69,15 @@ func (s *Server) SetTargetSink(fn func(targets []string)) {
 	s.sink = fn
 }
 
+// Epoch returns the highest ring epoch this node has accepted a handoff at. The
+// delivery outbox stamps its writes with it, which is how a node that has missed
+// a rebalance is fenced out.
+func (s *Server) Epoch() uint64 {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	return s.handoffEpoch
+}
+
 // Owned returns a copy of the targets this node currently owns.
 func (s *Server) Owned() []string {
 	s.handoffMu.Lock()
@@ -88,6 +97,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+joinPath, s.handleJoin)
 	mux.HandleFunc("POST "+handoffPath, s.handleHandoff)
+	mux.HandleFunc("POST "+outboxPath, s.handleOutbox)
 
 	srv := &http.Server{Addr: s.Addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	errCh := make(chan error, 1)
