@@ -26,7 +26,7 @@ const (
 	// heartbeats start failing before it removes that voter. It has to be
 	// longer than a typical StatefulSet pod restart (so a rolling restart
 	// doesn't evict and re-add every pod) but short enough to leave room for
-	// rebalancing inside the 10s failover SLO once Phase 6 lands.
+	// rebalancing inside the 10s failover SLO.
 	DefaultDeadVoterTimeout = 5 * time.Second
 
 	deadVoterCheckInterval = time.Second
@@ -264,6 +264,22 @@ func (n *RaftNode) Voters() []string {
 		}
 	}
 	return ids
+}
+
+// Members returns voter node ID -> advertised Raft address. The leader uses the
+// addresses to push assignments to each ring member.
+func (n *RaftNode) Members() map[string]string {
+	servers, err := n.servers()
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]string, len(servers))
+	for _, s := range servers {
+		if s.Suffrage == raft.Voter {
+			out[string(s.ID)] = string(s.Address)
+		}
+	}
+	return out
 }
 
 // Epoch returns the replicated ring epoch. It increases by one on every

@@ -83,8 +83,27 @@ func TestDesiredStatefulSetPeerAddrsAndRaftPVC(t *testing.T) {
 	}
 
 	mounts := sts.Spec.Template.Spec.Containers[0].VolumeMounts
-	if len(mounts) != 1 || mounts[0].Name != raftDataVolumeName || mounts[0].MountPath != raftDataMountPath {
+	if len(mounts) != 2 ||
+		mounts[0].Name != raftDataVolumeName || mounts[0].MountPath != raftDataMountPath ||
+		mounts[1].Name != targetsVolumeName || mounts[1].MountPath != targetsMountPath {
 		t.Fatalf("unexpected volume mounts: %+v", mounts)
+	}
+
+	// The targets mount must be backed by the operator's ConfigMap, and the
+	// worker told where to find the file, or the leader has nothing to place.
+	vols := sts.Spec.Template.Spec.Volumes
+	if len(vols) != 1 || vols[0].Name != targetsVolumeName || vols[0].ConfigMap == nil ||
+		vols[0].ConfigMap.Name != configMapName(scraper) {
+		t.Fatalf("expected targets volume backed by ConfigMap %q, got %+v", configMapName(scraper), vols)
+	}
+	var targetsFile string
+	for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "TARGETS_FILE" {
+			targetsFile = e.Value
+		}
+	}
+	if targetsFile != targetsMountPath+"/"+targetsConfigKey {
+		t.Fatalf("TARGETS_FILE = %q", targetsFile)
 	}
 }
 

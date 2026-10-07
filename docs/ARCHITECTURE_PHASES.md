@@ -292,7 +292,7 @@ go test ./internal/worker/...
 
 ---
 
-## Phase 6 — Work Placement (Consistent Hash Ring)
+## Phase 6 — Work Placement (Consistent Hash Ring) ✅ Complete
 
 **Decide:**
 
@@ -308,13 +308,36 @@ go test ./internal/worker/...
 3. Hand off to new owners
 4. Old owner **stops** scraping keys it no longer owns (epoch/lease)
 
-**Repo:** `internal/worker/hashring.go`, `TaskHandoff` in `internal/worker/server.go`
+### What's wired now
+
+| Piece | Where | Behavior |
+| --- | --- | --- |
+| Ring | `internal/worker/hashring.go` | SHA-256 positions, 64 virtual nodes per worker, `Get` = clockwise successor. `Assign` groups targets by owner (every member listed, even if empty). |
+| Target list | `internal/controller/resources.go`, `FileTargets` | The targets ConfigMap is mounted at `/etc/affinity/targets.yaml` (`TARGETS_FILE`); the leader re-reads it every tick. |
+| Placer | `internal/worker/placement.go` | Every node runs it, only the leader acts. Each tick: ring := Raft voters; desired := `Assign(targets)`; push any node whose set differs from what it was last sent. Leaders carry no placement state across failover, so a new leader re-sends everything once. |
+| Handoff | `Server.TaskHandoff`, `POST /handoff` | Full replacement set + ring epoch; applied via `engine.SetTargets`. Anything not listed stops being scraped. |
+| Fencing | `TaskHandoff` | Epoch lower than the highest accepted is rejected (`409`, `ErrStaleEpoch`). |
+| Drop-before-pick-up | `Placer.Reconcile` | Nodes losing targets are told first; if one is unreachable, gainers wait. Brief under-scrape beats double-scrape. |
+| Anti-entropy | `resyncInterval` (10s) | Assignments are re-sent so a restarted worker (empty engine, still a voter) heals. |
+
+**Known limits:** fencing is in-memory, so a restarted worker accepts any epoch until Phase 8 ties epochs to the outbox; an evicted-but-alive node (zombie) is never told to stop; that is Phase 9. `TargetsAssigned` CR condition is not set yet (Phase 10).
+
+**Proof of done:**
+
+```bash
+go test ./internal/worker/...
+# TestHashRingMinimalMovementOnRemove, TestTaskHandoffFencesStaleEpoch,
+# TestPlacementRebalancesOnMembershipChange (3 real nodes; a follower dies,
+# its targets move, every target is owned exactly once throughout).
+```
+
+**Repo:** `internal/worker/hashring.go`, `internal/worker/placement.go`, `TaskHandoff` in `internal/worker/server.go`
 
 **Invariant:** At steady state, each target appears in exactly one worker's `engine.targets`.
 
 ---
 
-## Phase 7 — Execution (Scrape Loop)
+## Phase 7 — Execution (Scrape Loop) ✅ Complete
 
 **Think in order:**
 
@@ -324,6 +347,23 @@ go test ./internal/worker/...
 4. **Side effect** = webhook (separate from detection)
 
 **Failure to design for:** Scrape succeeds, webhook fails — is chapter "seen" or not? That's the atomicity choice (`not started` until webhook ack + idempotency key).
+
+### What's wired now
+
+| Step | Where | Behavior |
+| --- | --- | --- |
+| Poll | `Engine.Run` / `pollAll` | Polls once at start, then every `SYNC_INTERVAL`, owned targets only (set by `TaskHandoff` → `SetTargets`). |
+| Fetch | `FetchTarget` | GET `SOURCE_URL` with `{target}` substituted; returns raw bytes. No interpretation. |
+| Parse | `ParseChapters` | Pure JSON → `[]Chapter`; accepts `12`, `"12"`, `"10.5"`; skips non-numeric entries. |
+| Detect | `DetectNew` | Numeric compare against per-target high-water mark, oldest first. Doesn't mutate state, except baselining a never-seen target silently. |
+| Notify | `PostToWebhook` + `MarkSeen` | Discord embed POST; any 2xx acks. The mark advances **only after** the ack. |
+
+**Atomicity choice:** webhook fails → chapter stays "new" and is retried next poll (at-least-once). Order is preserved: a failure stops that target's remaining chapters.
+**Ownership fence:** before each webhook the engine re-checks it still owns the target.
+
+**Known limits:** high-water marks are in memory and are dropped on ownership change or restart, so a moved target is re-baselined and a chapter released during the move is missed; Phase 8 moves marks and the outbox into Raft. Targets are polled sequentially. `SOURCE_URL` is a worker env var, not yet a CRD field.
+
+**Proof of done:** `go test ./internal/scraper/...` (baseline, numeric ordering, retry on webhook failure, no announce after losing ownership).
 
 **Repo:** `internal/scraper/engine.go`
 
@@ -420,8 +460,8 @@ Skip Discord polish and multi-source parsers until week 3's path works with a st
 | 3 — Control Plane: Operator Reconcile | ✅ Complete |
 | 4 — Worker Identity and Bootstrap | ✅ Complete |
 | 5 — Cluster Membership (Raft) | ✅ Complete |
-| 6 — Work Placement (Hash Ring) | 🔲 |
-| 7 — Execution (Scrape Loop) | 🔲 |
+| 6 — Work Placement (Hash Ring) | ✅ Complete |
+| 7 — Execution (Scrape Loop) | ✅ Complete |
 | 8 — Delivery and Idempotency | 🔲 |
 | 9 — Failure Detection and Recovery | 🔲 |
 | 10 — Observability and Ops | 🔲 |

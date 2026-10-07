@@ -23,6 +23,8 @@ const (
 	raftDataMountPath   = "/data/raft"
 	raftDataStorageSize = "1Gi"
 	targetsConfigKey    = "targets.yaml"
+	targetsVolumeName   = "targets"
+	targetsMountPath    = "/etc/affinity"
 	defaultSyncInterval = "30s"
 
 	ConditionWorkersReady = "WorkersReady"
@@ -150,6 +152,7 @@ func desiredStatefulSet(scraper *infrav1.DistributedScraper) *appsv1.StatefulSet
 								},
 								{Name: "BIND_ADDR", Value: ":7946"},
 								{Name: "DATA_DIR", Value: raftDataMountPath},
+								{Name: "TARGETS_FILE", Value: targetsMountPath + "/" + targetsConfigKey},
 								{Name: "SYNC_INTERVAL", Value: syncInterval},
 								{Name: "WEBHOOK_URL", Value: scraper.Spec.WebhookDestination},
 								{Name: "PEER_ADDRS", Value: strings.Join(peerAddresses(scraper), ",")},
@@ -158,6 +161,24 @@ func desiredStatefulSet(scraper *infrav1.DistributedScraper) *appsv1.StatefulSet
 								{
 									Name:      raftDataVolumeName,
 									MountPath: raftDataMountPath,
+								},
+								{
+									Name:      targetsVolumeName,
+									MountPath: targetsMountPath,
+									ReadOnly:  true,
+								},
+							},
+						},
+					},
+					// The targets ConfigMap is mounted as a file so the leader
+					// can read the target list to place. Kubelet refreshes the
+					// file when the ConfigMap changes, and the placer re-reads it.
+					Volumes: []corev1.Volume{
+						{
+							Name: targetsVolumeName,
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{Name: configMapName(scraper)},
 								},
 							},
 						},
