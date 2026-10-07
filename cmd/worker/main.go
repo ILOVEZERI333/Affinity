@@ -24,9 +24,11 @@ type Config struct {
 	PeerAddrs        []string
 	Bootstrap        bool // true for pod ordinal 0 only
 	DataDir          string
+	TargetsFile      string // newline-separated target IDs (operator's mounted ConfigMap)
 	SyncInterval     time.Duration
 	DeadVoterTimeout time.Duration
 	WebhookURL       string
+	SourceURL        string // chapter-list endpoint, "{target}" is substituted
 }
 
 func loadConfig() Config {
@@ -56,9 +58,11 @@ func loadConfig() Config {
 		PeerAddrs:        peers,
 		Bootstrap:        bootstrapFromEnv(),
 		DataDir:          getenv("DATA_DIR", "/data/raft"),
+		TargetsFile:      getenv("TARGETS_FILE", "/etc/affinity/targets.yaml"),
 		SyncInterval:     interval,
 		DeadVoterTimeout: deadVoterTimeout,
 		WebhookURL:       os.Getenv("WEBHOOK_URL"),
+		SourceURL:        os.Getenv("SOURCE_URL"),
 	}
 }
 
@@ -150,15 +154,19 @@ func main() {
 		}
 	}()
 
+	// The ring starts empty: on the leader, the placer fills it from the Raft
+	// voters each tick. Followers never consult it.
 	ring := worker.NewHashRing(64)
-	ring.AddNode(cfg.NodeID)
 
 	peerServer := worker.NewServer(cfg.APIBindAddr, raftNode, ring)
 	engine := scraper.NewEngine(cfg.WebhookURL)
+	engine.SourceURL = cfg.SourceURL
 
-	// TODO (Phase 6): the leader places Raft voters on the ring and pushes
-	// assignments; followers wait for TaskHandoff RPCs to populate
-	// engine.SetTargets.
+	// Accepted handoffs replace the engine's target set. Every node does this;
+	// only the leader runs the placer that sends them.
+	peerServer.SetTargetSink(engine.SetTargets)
+	placer := worker.NewPlacer(raftNode, ring, worker.FileTargets(cfg.TargetsFile))
+	go placer.Run(ctx)
 
 	go func() {
 		if err := peerServer.ListenAndServe(ctx); err != nil {

@@ -13,6 +13,8 @@ type testNode struct {
 	addr     string // raft address
 	dataDir  string
 	raft     *RaftNode
+	server   *Server
+	ring     *HashRing
 	cancelAP context.CancelFunc
 }
 
@@ -62,8 +64,10 @@ func startNode(t *testing.T, id string, port int, dataDir string, bootstrap bool
 	}
 	apiCtx, cancel := context.WithCancel(context.Background())
 	api, _ := PeerAPIAddr(addr)
-	go NewServer(api, n, NewHashRing(8)).ListenAndServe(apiCtx)
-	return &testNode{id: id, addr: addr, dataDir: dataDir, raft: n, cancelAP: cancel}
+	ring := NewHashRing(8)
+	srv := NewServer(api, n, ring)
+	go srv.ListenAndServe(apiCtx)
+	return &testNode{id: id, addr: addr, dataDir: dataDir, raft: n, server: srv, ring: ring, cancelAP: cancel}
 }
 
 func (n *testNode) stop() {

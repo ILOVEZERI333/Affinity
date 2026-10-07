@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -53,6 +54,26 @@ type Server struct {
 
 	raft *RaftNode
 	ring *HashRing
+
+	handoffMu    sync.Mutex
+	handoffEpoch uint64   // highest ring epoch a handoff has been accepted at
+	owned        []string // targets this node currently owns
+	sink         func(targets []string)
+}
+
+// SetTargetSink registers the callback that applies an accepted assignment,
+// normally scraper.Engine.SetTargets.
+func (s *Server) SetTargetSink(fn func(targets []string)) {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	s.sink = fn
+}
+
+// Owned returns a copy of the targets this node currently owns.
+func (s *Server) Owned() []string {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	return append([]string(nil), s.owned...)
 }
 
 // NewServer constructs a peer server backed by the given Raft node and hash
@@ -66,6 +87,7 @@ func NewServer(addr string, raftNode *RaftNode, ring *HashRing) *Server {
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+joinPath, s.handleJoin)
+	mux.HandleFunc("POST "+handoffPath, s.handleHandoff)
 
 	srv := &http.Server{Addr: s.Addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	errCh := make(chan error, 1)
@@ -119,10 +141,41 @@ func (s *Server) Join(ctx context.Context, nodeID, addr string) error {
 	return err
 }
 
-// TaskHandoff receives a set of target keys this node is now responsible
-// for, typically sent by the leader after a ring rebalance.
-func (s *Server) TaskHandoff(ctx context.Context, targets []string) error {
-	// TODO: hand targets off to the local scraper.Engine's schedule.
+func (s *Server) handleHandoff(w http.ResponseWriter, r *http.Request) {
+	var req handoffRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		http.Error(w, "invalid handoff body", http.StatusBadRequest)
+		return
+	}
+	switch err := s.TaskHandoff(r.Context(), req.Epoch, req.Targets); {
+	case err == nil:
+		w.WriteHeader(http.StatusOK)
+	case errors.Is(err, ErrStaleEpoch):
+		http.Error(w, err.Error(), http.StatusConflict)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// TaskHandoff replaces the set of targets this node owns, as sent by the
+// leader after a ring change. The set is the complete assignment, so any target
+// not in it stops being scraped here.
+//
+// Fencing: a handoff stamped with an epoch lower than one already accepted is
+// rejected. Epochs only grow (every membership change bumps one), so a stale or
+// deposed leader that still holds an old view of the ring cannot take work back.
+// Equal epochs are accepted so the leader can safely re-send (idempotent).
+func (s *Server) TaskHandoff(ctx context.Context, epoch uint64, targets []string) error {
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	if epoch < s.handoffEpoch {
+		return ErrStaleEpoch
+	}
+	s.handoffEpoch = epoch
+	s.owned = append([]string(nil), targets...)
+	if s.sink != nil {
+		s.sink(s.owned)
+	}
 	return nil
 }
 
