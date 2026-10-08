@@ -361,7 +361,7 @@ go test ./internal/worker/...
 **Atomicity choice:** webhook fails → chapter stays "new" and is retried next poll (at-least-once). Order is preserved: a failure stops that target's remaining chapters.
 **Ownership fence:** before each webhook the engine re-checks it still owns the target.
 
-**Known limits:** high-water marks are in memory and are dropped on ownership change or restart, so a moved target is re-baselined and a chapter released during the move is missed; Phase 8 moves marks and the outbox into Raft. Targets are polled sequentially. `SOURCE_URL` is a worker env var, not yet a CRD field.
+**Known limits:** high-water marks were in memory in this phase (fixed in Phase 8, where they live in the Raft outbox). Targets are polled sequentially. `SOURCE_URL` is a worker env var, not yet a CRD field.
 
 **Proof of done:** `go test ./internal/scraper/...` (baseline, numeric ordering, retry on webhook failure, no announce after losing ownership).
 
@@ -369,7 +369,7 @@ go test ./internal/worker/...
 
 ---
 
-## Phase 8 — Delivery and Idempotency
+## Phase 8 — Delivery and Idempotency ✅ Complete
 
 **Decided in Phase 1** (implement here):
 
@@ -382,6 +382,42 @@ go test ./internal/worker/...
 **Industry pattern:** transactional **outbox** — write "pending notification" to Raft, then deliver; retry until ack.
 
 **This is where** leases + fencing tokens attach to real code paths (ring epoch gates outbox writes).
+
+### What's wired now
+
+| Piece | Where | Behavior |
+| --- | --- | --- |
+| Outbox state machine | `internal/scraper/outbox.go` `OutboxState` | Deterministic, no I/O. Holds each target's **high-water mark** plus the **pending** chapters. Delivered chapters are not stored: any number at or below the mark counts as delivered, so replicated state stays bounded. The Raft FSM and the single-node `LocalOutbox` share this one implementation. |
+| Replication | `internal/worker/raft.go` `ringFSM` | `outbox_baseline` / `outbox_enqueue` / `outbox_ack` commands in the Raft log; included in snapshots (a pre-Phase-8 snapshot still restores). |
+| Writes from any worker | `internal/worker/outbox.go` `OutboxClient` | Leader applies locally; followers forward to the leader's `POST /outbox` (421 + leader hint, like `/join`). A write returns only once committed, so a successor leader sees it. |
+| Delivery sequence | `Engine.pollTarget` | `Enqueue` (pending) → webhook POST → `Ack` (delivered, advances the mark, in one Raft entry). The mark moves **only** through `Ack`. |
+| Unknown outcome | `Enqueue` | Repeating `Enqueue` is how a worker asks "did this land?": the leader answers `delivered` (covered by the mark) or `pending` (POST again). A lagging local mark can re-surface a delivered chapter, but `Enqueue` is evaluated by the leader, so it is never re-posted. |
+| Moves keep history | `Engine.DetectNew` | The mark comes from the outbox, not engine memory, so a target moved by the ring is neither re-baselined (which silently skipped a release) nor re-announced. Closes the Phase 7 limit. |
+| Backoff | `Engine.pollAll` / `recordResult` | Per target, after a failed fetch, parse, or webhook (5xx/timeout): 5s doubling to a 10 min cap, reset on success. Outbox failures (no leader, fenced) do **not** back off: they hit every target at once and clear in seconds, so the next tick retries. |
+| Fencing | `ringFSM.applyOutbox` | Every write carries the writer's last accepted handoff epoch (`Server.Epoch`). If the replicated ring epoch has moved past it, the FSM rejects the write with `ErrStaleEpoch` (HTTP 409). A worker that missed a rebalance cannot enqueue, baseline, or ack an unknown chapter. **Exception:** an ack for a chapter that is already pending is accepted from a stale writer — the webhook did fire, so the ack only records a fact, and rejecting it would duplicate the announcement on every rebalance between POST and Ack. |
+| Idempotency key | webhook request | `Idempotency-Key: {target}:{chapter}` header, for receivers that dedupe. Discord ignores it. |
+
+**Known limits:**
+
+- The window between a successful POST and a committed `Ack` is inherent: if the worker dies there (or the ack fails three times), the chapter is still `pending` and the next owner POSTs it again. Delivery is at-least-once; the header is the only protection beyond that.
+- A fenced zombie is rejected only once it makes a write. Telling an evicted-but-alive node to stop scraping is Phase 9.
+- Targets are still polled sequentially, and `SOURCE_URL` is still a worker env var.
+- `POST /outbox` (like `/join` and `/handoff`) is unauthenticated and trusts the caller's epoch; it relies on the API port being cluster-internal. Peer authentication is Phase 11.
+- A worker whose local FSM has not yet replayed the log reports no mark and issues a (no-op) `Baseline`, delaying that target by one poll.
+- A fresh worker's epoch is 0 until its first handoff, so its writes are rejected (and retried with backoff) until the leader's next push, at most `resyncInterval`.
+
+**Proof of done:**
+
+```bash
+go test ./internal/scraper/... ./internal/worker/...
+# TestOutboxReplicatesAndForwardsThroughLeader: follower writes forward to the
+# leader and replicate to both nodes; a repeated Enqueue is idempotent; after
+# Ack it answers "delivered"; a stale-epoch writer gets ErrStaleEpoch.
+# TestMovedTargetKeepsHistory, TestAlreadyDeliveredChapterIsNotReposted,
+# TestWebhookFailureKeepsChapterPendingAndBacksOff (engine).
+```
+
+**Repo:** `internal/scraper/outbox.go`, `internal/worker/outbox.go`, `ringFSM` in `internal/worker/raft.go`
 
 ---
 
@@ -462,7 +498,7 @@ Skip Discord polish and multi-source parsers until week 3's path works with a st
 | 5 — Cluster Membership (Raft) | ✅ Complete |
 | 6 — Work Placement (Hash Ring) | ✅ Complete |
 | 7 — Execution (Scrape Loop) | ✅ Complete |
-| 8 — Delivery and Idempotency | 🔲 |
+| 8 — Delivery and Idempotency | ✅ Complete |
 | 9 — Failure Detection and Recovery | 🔲 |
 | 10 — Observability and Ops | 🔲 |
 | 11 — Hardening | 🔲 |
