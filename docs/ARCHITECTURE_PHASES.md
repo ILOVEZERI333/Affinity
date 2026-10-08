@@ -296,7 +296,18 @@ Raft answers: **who is in the cluster, who is leader, what config is authoritati
 
 ---
 
-## Phase 9 — Failure Detection and Recovery
+## Phase 9 — Failure Detection and Recovery 🟡 Partial
+
+**Implemented (standalone, unit-tested in `internal/worker/recovery_test.go`):**
+
+| Mechanism | Code |
+| --- | --- |
+| K8s liveness | `LivenessHandler` (`health.go`), served on `HEALTH_ADDR` (`:8080`) at `/healthz`; no Raft/peer dependency by design |
+| Heartbeat failure detector | `FailureDetector` (`failure.go`): Alive → Suspect (2s) → Dead (5s); `Server.Heartbeat` feeds it |
+| Ring rebalance | `HashRing` implemented; `RecoverFromFailure` / `DiffAssignments` (`rebalance.go`) — only the dead node's targets move |
+| Zombie fencing | `EpochFence` (`fence.go`): epoch bumps on every membership change; stale-epoch writes get `ErrStaleEpoch` |
+
+**Not yet wired (blocked on Phases 4–8):** Raft is still stubbed, so nothing yet calls `Check()` on a timer, commits removal + epoch through the log, pushes `TaskHandoff`, or checks the fence on outbox commits. Leader-election-during-handoff and 3→5 scale-up scenarios need those first.
 
 **Order of mechanisms:**
 
@@ -374,6 +385,6 @@ Skip Discord polish and multi-source parsers until week 3's path works with a st
 | 6 — Work Placement (Hash Ring) | 🔲 |
 | 7 — Execution (Scrape Loop) | 🔲 |
 | 8 — Delivery and Idempotency | 🔲 |
-| 9 — Failure Detection and Recovery | 🔲 |
+| 9 — Failure Detection and Recovery | 🟡 Partial (standalone pieces; wiring blocked on 4–8) |
 | 10 — Observability and Ops | 🔲 |
 | 11 — Hardening | 🔲 |

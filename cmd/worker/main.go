@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -76,7 +77,8 @@ func main() {
 	ring := worker.NewHashRing(64)
 	ring.AddNode(cfg.NodeID)
 
-	peerServer := worker.NewServer(cfg.BindAddr, raftNode, ring)
+	detector := worker.NewFailureDetector(2*time.Second, 5*time.Second, nil)
+	peerServer := worker.NewServer(cfg.BindAddr, raftNode, ring, detector)
 	engine := scraper.NewEngine(cfg.WebhookURL)
 
 	// TODO: once raftNode.IsLeader() is meaningful, only the leader should
@@ -88,6 +90,18 @@ func main() {
 		if err := peerServer.ListenAndServe(ctx); err != nil {
 			log.Printf("peer server stopped: %v", err)
 		}
+	}()
+
+	// Kubernetes liveness probe target (httpGet /healthz on HEALTH_ADDR).
+	healthSrv := &http.Server{Addr: getenv("HEALTH_ADDR", ":8080"), Handler: worker.LivenessHandler()}
+	go func() {
+		if err := healthSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("health server stopped: %v", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = healthSrv.Close()
 	}()
 
 	go engine.Run(ctx, cfg.SyncInterval)

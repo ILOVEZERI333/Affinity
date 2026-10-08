@@ -11,16 +11,17 @@ import (
 type Server struct {
 	Addr string
 
-	raft *RaftNode
-	ring *HashRing
+	raft     *RaftNode
+	ring     *HashRing
+	detector *FailureDetector
 
 	listener net.Listener
 }
 
-// NewServer constructs a peer server backed by the given Raft node and hash
-// ring, both of which the RPC handlers below read/mutate.
-func NewServer(addr string, raftNode *RaftNode, ring *HashRing) *Server {
-	return &Server{Addr: addr, raft: raftNode, ring: ring}
+// NewServer constructs a peer server backed by the given Raft node, hash
+// ring and failure detector, which the RPC handlers below read/mutate.
+func NewServer(addr string, raftNode *RaftNode, ring *HashRing, detector *FailureDetector) *Server {
+	return &Server{Addr: addr, raft: raftNode, ring: ring, detector: detector}
 }
 
 // ListenAndServe binds Addr and blocks, serving peer RPCs until ctx is
@@ -34,7 +35,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 // Heartbeat answers a liveness probe from another node.
 func (s *Server) Heartbeat(ctx context.Context, fromNodeID string) error {
-	// TODO: record last-seen time for fromNodeID for failure detection.
+	if s.detector != nil {
+		s.detector.Heartbeat(fromNodeID)
+	}
 	return nil
 }
 
