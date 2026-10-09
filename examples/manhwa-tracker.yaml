@@ -1,0 +1,12 @@
+apiVersion: infra.tony/v1
+kind: DistributedScraper
+metadata:
+  name: manhwa-tracker
+spec:
+  targetList:
+    - solo-leveling
+    - omniscient-reader
+    - tower-of-god
+  workerNodes: 3
+  syncInterval: "30s"
+  webhookDestination: "https://discord.com/api/webhooks/example"
