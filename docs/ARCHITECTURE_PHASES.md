@@ -421,15 +421,15 @@ go test ./internal/scraper/... ./internal/worker/...
 
 ---
 
-## Phase 9 — Failure Detection and Recovery
+## Phase 9 — Failure Detection and Recovery 🟡 Partial
 
-**Order of mechanisms:**
+**Order of mechanisms, and where each lives:**
 
-1. **K8s liveness** — pod dead → replaced
-2. **Raft** — leader dead → new election
-3. **Heartbeats** between workers (`Heartbeat` in `server.go`) — optional supplement, not substitute for Raft
-4. **Ring rebalance** — dead node removed, targets reassigned
-5. **Zombie handling** — stale owner can't commit (epoch/lease)
+1. **K8s liveness** — pod dead → replaced. ✅ `LivenessHandler` (`internal/worker/health.go`) serves `/healthz` on `HEALTH_ADDR` (`:8080`); the operator adds an httpGet `LivenessProbe` to the worker container. Deliberately independent of Raft/peers so an election never causes restarts.
+2. **Raft** — leader dead → new election. ✅ Phase 5.
+3. **Heartbeats** — ✅ Raft's own heartbeats; the leader's `monitorDeadVoters` evicts a voter silent for `DeadVoterTimeout` (5s). No separate worker-level heartbeat was added: it would duplicate this.
+4. **Ring rebalance** — dead node removed, targets reassigned. ✅ Phase 6 (`Placer.Reconcile` rebuilds the ring from voters and hands off the diff).
+5. **Zombie handling** — stale owner can't commit. ✅ Epoch fencing on handoffs (Phase 6) and outbox writes (Phase 8). 🔲 **Still open:** an evicted-but-alive node is only fenced when it writes; nothing tells it to stop scraping.
 
 **Walkthrough scenarios** (one per study session):
 
@@ -499,6 +499,6 @@ Skip Discord polish and multi-source parsers until week 3's path works with a st
 | 6 — Work Placement (Hash Ring) | ✅ Complete |
 | 7 — Execution (Scrape Loop) | ✅ Complete |
 | 8 — Delivery and Idempotency | ✅ Complete |
-| 9 — Failure Detection and Recovery | 🔲 |
+| 9 — Failure Detection and Recovery | 🟡 Liveness probe added; zombie stop-signal open |
 | 10 — Observability and Ops | 🔲 |
 | 11 — Hardening | 🔲 |

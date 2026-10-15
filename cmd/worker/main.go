@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -176,6 +177,24 @@ func main() {
 		if err := peerServer.ListenAndServe(ctx); err != nil {
 			log.Printf("peer server stopped: %v", err)
 		}
+	}()
+
+	// Kubernetes liveness probe target (httpGet /healthz). It intentionally
+	// ignores Raft state: failure *detection* of peers is Raft's job, and tying
+	// the probe to it would make Kubernetes restart healthy pods during an election.
+	healthSrv := &http.Server{
+		Addr:              getenv("HEALTH_ADDR", ":8080"),
+		Handler:           worker.LivenessHandler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := healthSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("health server stopped: %v", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = healthSrv.Close()
 	}()
 
 	go engine.Run(ctx, cfg.SyncInterval)

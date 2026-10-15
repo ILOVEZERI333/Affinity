@@ -19,6 +19,7 @@ const (
 	workerImage         = "distriscrape-worker:latest"
 	workerPort          = 7946
 	workerAPIPort       = 7947 // peer API (join/handoff); Raft's port + 1
+	workerHealthPort    = 8080 // liveness probe (/healthz)
 	raftDataVolumeName  = "raft-data"
 	raftDataMountPath   = "/data/raft"
 	raftDataStorageSize = "1Gi"
@@ -156,6 +157,20 @@ func desiredStatefulSet(scraper *infrav1.DistributedScraper) *appsv1.StatefulSet
 								{Name: "SYNC_INTERVAL", Value: syncInterval},
 								{Name: "WEBHOOK_URL", Value: scraper.Spec.WebhookDestination},
 								{Name: "PEER_ADDRS", Value: strings.Join(peerAddresses(scraper), ",")},
+							},
+							// Process-level liveness only (see worker.LivenessHandler):
+							// a dead or wedged process gets replaced; Raft state is
+							// deliberately not consulted.
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/healthz",
+										Port: intstr.FromInt(workerHealthPort),
+									},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       5,
+								FailureThreshold:    3,
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
