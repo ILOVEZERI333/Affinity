@@ -421,7 +421,7 @@ go test ./internal/scraper/... ./internal/worker/...
 
 ---
 
-## Phase 9 — Failure Detection and Recovery 🟡 Partial
+## Phase 9 — Failure Detection and Recovery ✅ Complete
 
 **Order of mechanisms, and where each lives:**
 
@@ -429,7 +429,7 @@ go test ./internal/scraper/... ./internal/worker/...
 2. **Raft** — leader dead → new election. ✅ Phase 5.
 3. **Heartbeats** — ✅ Raft's own heartbeats; the leader's `monitorDeadVoters` evicts a voter silent for `DeadVoterTimeout` (5s). No separate worker-level heartbeat was added: it would duplicate this.
 4. **Ring rebalance** — dead node removed, targets reassigned. ✅ Phase 6 (`Placer.Reconcile` rebuilds the ring from voters and hands off the diff).
-5. **Zombie handling** — stale owner can't commit. ✅ Epoch fencing on handoffs (Phase 6) and outbox writes (Phase 8). 🔲 **Still open:** an evicted-but-alive node is only fenced when it writes; nothing tells it to stop scraping.
+5. **Zombie handling** — stale owner can't commit. ✅ Epoch fencing on handoffs (Phase 6) and outbox writes (Phase 8). A node leaderless for longer than `DeadVoterTimeout` clears its targets (`maintainMembership`); the leader re-hands them after it rejoins.
 
 **Walkthrough scenarios** (one per study session):
 
