@@ -109,7 +109,12 @@ func bootstrapFromEnv() bool {
 // leader is either brand new or was evicted as a dead voter while it was down,
 // so it asks the cluster to (re)add it. Joining is idempotent. The leader
 // never needs to join: it already is the cluster.
-func maintainMembership(ctx context.Context, n *worker.RaftNode, cfg Config) {
+//
+// A node cut off from the leader for longer than DeadVoterTimeout has likely
+// been evicted, and its targets reassigned, so it stops scraping (zombie
+// handling, Phase 9). The leader re-hands it targets once it rejoins.
+func maintainMembership(ctx context.Context, n *worker.RaftNode, cfg Config, stopScraping func()) {
+	var leaderlessSince time.Time
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -119,7 +124,13 @@ func maintainMembership(ctx context.Context, n *worker.RaftNode, cfg Config) {
 		case <-ticker.C:
 		}
 		if n.IsLeader() || n.LeaderAddr() != "" {
+			leaderlessSince = time.Time{}
 			continue
+		}
+		if leaderlessSince.IsZero() {
+			leaderlessSince = time.Now()
+		} else if time.Since(leaderlessSince) > cfg.DeadVoterTimeout {
+			stopScraping()
 		}
 		if err := worker.JoinCluster(ctx, cfg.PeerAddrs, cfg.NodeID, cfg.AdvertiseAddr); err != nil {
 			log.Printf("join cluster: %v", err)
@@ -137,6 +148,12 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	exitCode := 0
+	defer func() { // registered before the raft shutdown defer, so it runs after it
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+	}()
 
 	raftNode, err := worker.NewRaftNode(worker.RaftNodeConfig{
 		NodeID:           cfg.NodeID,
@@ -187,9 +204,10 @@ func main() {
 		Handler:           worker.LivenessHandler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	healthErr := make(chan error, 1)
 	go func() {
 		if err := healthSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("health server stopped: %v", err)
+			healthErr <- err
 		}
 	}()
 	go func() {
@@ -198,9 +216,15 @@ func main() {
 	}()
 
 	go engine.Run(ctx, cfg.SyncInterval)
-	go maintainMembership(ctx, raftNode, cfg)
+	go maintainMembership(ctx, raftNode, cfg, func() { engine.SetTargets(nil) })
 
 	log.Printf("worker %s ready (bind=%s)", cfg.NodeID, cfg.BindAddr)
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-healthErr:
+		// Without a probe target Kubernetes would kill the pod anyway; exit visibly.
+		log.Printf("health server failed: %v", err)
+		exitCode = 1
+	}
 	log.Println("worker shutting down")
 }
