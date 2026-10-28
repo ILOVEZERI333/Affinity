@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/affinity/distriscrape/internal/metrics"
 	"github.com/affinity/distriscrape/internal/scraper"
 	"github.com/affinity/distriscrape/internal/worker"
 )
@@ -130,13 +133,14 @@ func maintainMembership(ctx context.Context, n *worker.RaftNode, cfg Config, sto
 		if leaderlessSince.IsZero() {
 			leaderlessSince = time.Now()
 		} else if time.Since(leaderlessSince) > cfg.DeadVoterTimeout {
+			slog.Warn("cut off from the leader; dropping targets", "leaderless_for", time.Since(leaderlessSince).Round(time.Second).String())
 			stopScraping()
 		}
 		if err := worker.JoinCluster(ctx, cfg.PeerAddrs, cfg.NodeID, cfg.AdvertiseAddr); err != nil {
-			log.Printf("join cluster: %v", err)
+			slog.Warn("join cluster failed", "err", err)
 			continue
 		}
-		log.Printf("joined cluster as %s", cfg.NodeID)
+		slog.Info("joined cluster")
 	}
 }
 
@@ -145,6 +149,16 @@ func main() {
 	if cfg.NodeID == "" {
 		log.Fatal("NODE_ID (or POD_NAME) must be set")
 	}
+
+	// Every log line carries the node and the current Raft term. The term is
+	// read from the node once it exists; before that it logs 0.
+	var raftRef atomic.Pointer[worker.RaftNode]
+	slog.SetDefault(worker.NewLogger(os.Stderr, cfg.NodeID, func() uint64 {
+		if n := raftRef.Load(); n != nil {
+			return n.Term()
+		}
+		return 0
+	}))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -166,9 +180,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to start raft node: %v", err)
 	}
+	raftRef.Store(raftNode)
 	defer func() {
 		if err := raftNode.Shutdown(); err != nil {
-			log.Printf("raft shutdown: %v", err)
+			slog.Error("raft shutdown", "err", err)
 		}
 	}()
 
@@ -192,16 +207,19 @@ func main() {
 
 	go func() {
 		if err := peerServer.ListenAndServe(ctx); err != nil {
-			log.Printf("peer server stopped: %v", err)
+			slog.Error("peer server stopped", "err", err)
 		}
 	}()
 
-	// Kubernetes liveness probe target (httpGet /healthz). It intentionally
-	// ignores Raft state: failure *detection* of peers is Raft's job, and tying
-	// the probe to it would make Kubernetes restart healthy pods during an election.
+	// Health port: /healthz (liveness; deliberately ignores Raft state, since
+	// failure *detection* of peers is Raft's job and tying the probe to it would
+	// restart healthy pods during an election), /readyz (a leader is known),
+	// /status (polled by the operator) and /metrics.
+	nodeStatus := func() worker.NodeStatus { return worker.CollectStatus(raftNode, peerServer, engine.LastPoll) }
+	worker.RegisterNodeMetrics(metrics.Registry, nodeStatus)
 	healthSrv := &http.Server{
 		Addr:              getenv("HEALTH_ADDR", ":8080"),
-		Handler:           worker.LivenessHandler(),
+		Handler:           worker.HealthHandler(nodeStatus),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	healthErr := make(chan error, 1)
@@ -218,13 +236,13 @@ func main() {
 	go engine.Run(ctx, cfg.SyncInterval)
 	go maintainMembership(ctx, raftNode, cfg, func() { engine.SetTargets(nil) })
 
-	log.Printf("worker %s ready (bind=%s)", cfg.NodeID, cfg.BindAddr)
+	slog.Info("worker ready", "bind", cfg.BindAddr)
 	select {
 	case <-ctx.Done():
 	case err := <-healthErr:
 		// Without a probe target Kubernetes would kill the pod anyway; exit visibly.
-		log.Printf("health server failed: %v", err)
+		slog.Error("health server failed", "err", err)
 		exitCode = 1
 	}
-	log.Println("worker shutting down")
+	slog.Info("worker shutting down")
 }
