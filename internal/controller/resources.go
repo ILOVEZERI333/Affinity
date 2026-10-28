@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -99,6 +100,12 @@ func desiredService(scraper *infrav1.DistributedScraper) *corev1.Service {
 					TargetPort: intstr.FromInt32(workerAPIPort),
 					Protocol:   corev1.ProtocolTCP,
 				},
+				{
+					Name:       "health",
+					Port:       workerHealthPort,
+					TargetPort: intstr.FromInt32(workerHealthPort),
+					Protocol:   corev1.ProtocolTCP,
+				},
 			},
 		},
 	}
@@ -121,12 +128,23 @@ func desiredStatefulSet(scraper *infrav1.DistributedScraper) *appsv1.StatefulSet
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:    &scraper.Spec.WorkerNodes,
 			ServiceName: name,
+			// Readiness waits for a Raft leader, which needs a quorum of pods
+			// running. With the default OrderedReady policy pod N+1 would wait
+			// for pod N to be Ready and a cold start could never form one.
+			// (Immutable: only applies to StatefulSets created after this.)
+			PodManagementPolicy: appsv1.ParallelPodManagement,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: podLabels,
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: podLabels,
+					// The de-facto convention for Prometheus pod discovery.
+					Annotations: map[string]string{
+						"prometheus.io/scrape": "true",
+						"prometheus.io/port":   strconv.Itoa(workerHealthPort),
+						"prometheus.io/path":   "/metrics",
+					},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -171,6 +189,23 @@ func desiredStatefulSet(scraper *infrav1.DistributedScraper) *appsv1.StatefulSet
 								InitialDelaySeconds: 5,
 								PeriodSeconds:       5,
 								FailureThreshold:    3,
+							},
+							// Readiness (unlike liveness) does look at Raft: a pod with
+							// no known leader is unready, which keeps it out of
+							// ReadyWorkers without getting it restarted.
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/readyz",
+										Port: intstr.FromInt(workerHealthPort),
+									},
+								},
+								InitialDelaySeconds: 2,
+								PeriodSeconds:       5,
+								FailureThreshold:    2,
+							},
+							Ports: []corev1.ContainerPort{
+								{Name: "health", ContainerPort: workerHealthPort, Protocol: corev1.ProtocolTCP},
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{

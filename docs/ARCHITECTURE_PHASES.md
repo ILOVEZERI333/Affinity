@@ -320,7 +320,7 @@ go test ./internal/worker/...
 | Drop-before-pick-up | `Placer.Reconcile` | Nodes losing targets are told first; if one is unreachable, gainers wait. Brief under-scrape beats double-scrape. |
 | Anti-entropy | `resyncInterval` (10s) | Assignments are re-sent so a restarted worker (empty engine, still a voter) heals. |
 
-**Known limits:** fencing is in-memory, so a restarted worker accepts any epoch until Phase 8 ties epochs to the outbox; an evicted-but-alive node (zombie) is never told to stop; that is Phase 9. `TargetsAssigned` CR condition is not set yet (Phase 10).
+**Known limits:** fencing is in-memory, so a restarted worker accepts any epoch until Phase 8 ties epochs to the outbox; an evicted-but-alive node (zombie) is never told to stop; that is Phase 9. The `TargetsAssigned` CR condition reports this invariant as of Phase 10.
 
 **Proof of done:**
 
@@ -440,16 +440,45 @@ go test ./internal/scraper/... ./internal/worker/...
 
 ---
 
-## Phase 10 — Observability and Ops
+## Phase 10 — Observability and Ops ✅ Complete
 
-**After** core loop works:
+**Question each piece answers:** is it up, who leads, does every target have exactly one owner, and how is it behaving?
 
-- Structured logs (node, target, leader term)
-- Metrics: scrape latency, webhook failures, ring rebalance count
-- Status conditions on CR (`Ready`, `LeaderElected`, `TargetsAssigned`)
-- Health endpoints on operator and worker
+### What's wired now
 
-Platform interviews care that you can **debug** the system, not only draw it.
+| Piece | Where | Behavior |
+| --- | --- | --- |
+| Structured logs (worker) | `internal/worker/logging.go` | `log/slog` JSON. Every line carries `node` and the **live** Raft `term` (read per record, so lines across an election show the change); call sites add `target`, `peer`, `epoch`. |
+| Structured logs (operator) | `cmd/operator/main.go` | controller-runtime zap, JSON by default (`--zap-devel` for console). Phase changes are logged with leader and unassigned/duplicated counts. |
+| Worker metrics | `internal/metrics`, `worker.RegisterNodeMetrics` | `affinity_scrape_duration_seconds{result}`, `affinity_webhook_failures_total`, `affinity_chapters_announced_total`, `affinity_ring_rebalances_total` (leader only; the first fill of an empty ring is not a rebalance), plus gauges read at scrape time: `affinity_raft_is_leader`, `_raft_term`, `_ring_epoch`, `_raft_voters`, `_owned_targets`. No per-target labels, so series count does not grow with the target list. |
+| Operator metrics | `internal/controller/observe.go` | controller-runtime's reconcile metrics on `:8080`, plus `affinity_cluster_ready` and `affinity_cluster_ready_workers` per CR. |
+| Worker health | `worker.HealthHandler`, port 8080 | `/healthz` liveness (ignores Raft, Phase 9), `/readyz` readiness (**a leader is known**), `/status` JSON (read by the operator), `/metrics`. |
+| Operator health | `cmd/operator/main.go` | `/healthz` and `/readyz` on `:8081`. |
+| CR conditions | `internal/controller/observe.go` | The operator polls `/status` on every ordinal. `LeaderElected` (highest-term leader claim wins), `TargetsAssigned` (each spec target owned by exactly one worker; names the unowned or duplicated ones), `Ready` (`WorkersReady` ∧ both). Also sets `status.leaderNode` and `status.lastSyncTime`. |
+| Phase | `nextPhase` | `Running` when Ready; `Degraded` if it had been Running; otherwise `Provisioning`. Requeues every 10s while converging, 30s once steady. |
+
+**Design notes:**
+
+- Liveness and readiness are deliberately different. A pod with no known leader is *unready* (so `readyWorkers` drops and the CR goes `Degraded`) but is never restarted for it.
+- The StatefulSet now uses `Parallel` pod management. Readiness needs a leader, which needs a quorum of running pods, so `OrderedReady` would deadlock a cold start. The field is immutable: StatefulSets created before this change keep `OrderedReady`.
+- Raft's own library logs (hclog) and the standard-library `log` are not restructured.
+
+**Known limits:** no Prometheus Operator `ServiceMonitor`; pods carry the `prometheus.io/*` annotations instead. The operator's `/readyz` is a ping. `/status`, like the other peer endpoints, is unauthenticated (Phase 11). `-race` was not run (no C toolchain on the dev machine).
+
+**Proof of done:**
+
+```bash
+go test ./internal/controller/... ./internal/worker/... ./internal/scraper/...
+# TestReconcileWritesObservedStatus (leader/targets -> CR status, Running -> Degraded on leader loss),
+# TestConditionsExplainWhatIsMissing, TestHealthHandlerReadinessFollowsLeader,
+# TestLoggerStampsNodeAndLiveTerm, TestSyncRingCountsRebalancesButNotInitialFill,
+# TestPollRecordsMetrics.
+```
+
+**Repo:** `internal/metrics/`, `internal/status/`, `internal/worker/{health,logging}.go`, `internal/controller/observe.go`
+
+**Invariant:** `Ready=True` implies a leader is known and every target in the spec is owned by exactly one worker.
+
 
 ---
 
@@ -499,6 +528,6 @@ Skip Discord polish and multi-source parsers until week 3's path works with a st
 | 6 — Work Placement (Hash Ring) | ✅ Complete |
 | 7 — Execution (Scrape Loop) | ✅ Complete |
 | 8 — Delivery and Idempotency | ✅ Complete |
-| 9 — Failure Detection and Recovery | 🟡 Liveness probe added; zombie stop-signal open |
-| 10 — Observability and Ops | 🔲 |
+| 9 — Failure Detection and Recovery | ✅ Complete |
+| 10 — Observability and Ops | ✅ Complete |
 | 11 — Hardening | 🔲 |
