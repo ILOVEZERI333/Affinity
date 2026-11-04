@@ -6,10 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -241,6 +242,12 @@ func (n *RaftNode) LeaderAddr() string {
 	return string(addr)
 }
 
+// LeaderID returns the node ID of the current leader, or "" if there is none.
+func (n *RaftNode) LeaderID() string {
+	_, id := n.raft.LeaderWithID()
+	return string(id)
+}
+
 // IsMember reports whether this node's local view of the Raft configuration
 // lists it as a voter. A node evicted while it was down still believes it is a
 // member until it hears from the leader, so callers pair this with
@@ -288,6 +295,15 @@ func (n *RaftNode) Members() map[string]string {
 		}
 	}
 	return out
+}
+
+// Term returns this node's current Raft term, or 0 if it cannot be read.
+func (n *RaftNode) Term() uint64 {
+	t, err := strconv.ParseUint(n.raft.Stats()["term"], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return t
 }
 
 // Epoch returns the replicated ring epoch. It increases by one on every
@@ -418,10 +434,10 @@ func (n *RaftNode) monitorDeadVoters(ctx context.Context) {
 					continue
 				}
 				if err := n.Leave(string(id)); err != nil {
-					log.Printf("raft: removing dead voter %s: %v", id, err)
+					slog.Error("raft: removing dead voter failed", "peer", string(id), "err", err)
 					continue
 				}
-				log.Printf("raft: removed dead voter %s (no heartbeat for %s)", id, time.Since(since).Round(time.Millisecond))
+				slog.Warn("raft: removed dead voter", "peer", string(id), "silent_for", time.Since(since).Round(time.Millisecond).String())
 				delete(downSince, id)
 			}
 		}

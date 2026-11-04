@@ -7,13 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/affinity/distriscrape/internal/metrics"
 )
 
 const (
@@ -49,9 +51,10 @@ type Chapter struct {
 // What has been announced lives in the Outbox, not in the engine, so it
 // survives restarts and follows a target when the ring moves it.
 type Engine struct {
-	mu      sync.Mutex
-	targets map[string]struct{} // target IDs currently owned by this node
-	retry   map[string]retryState
+	mu       sync.Mutex
+	targets  map[string]struct{} // target IDs currently owned by this node
+	retry    map[string]retryState
+	lastPoll time.Time // end of the most recent pass over the owned targets
 
 	// Outbox records pending and delivered notifications. NewEngine installs an
 	// in-process one; the worker swaps in the Raft-replicated one.
@@ -156,7 +159,16 @@ func (e *Engine) recordResult(target string, err error) {
 	delay := e.backoffDelay(st.fails)
 	st.next = e.now().Add(delay)
 	e.retry[target] = st
-	log.Printf("scraper: %s: %v (failure %d, next try in %s)", target, err, st.fails, delay)
+	slog.Warn("scraper: poll failed", "target", target, "err", err, "failures", st.fails, "retry_in", delay.String())
+}
+
+// LastPoll returns when the most recent pass over the owned targets finished,
+// or the zero time if none has. Passes with no targets still count: the engine
+// is alive and in sync, it just has nothing to do.
+func (e *Engine) LastPoll() time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.lastPoll
 }
 
 func (e *Engine) owns(target string) bool {
@@ -199,7 +211,23 @@ func (e *Engine) pollAll(ctx context.Context) {
 		if e.backingOff(target) {
 			continue
 		}
-		e.recordResult(target, e.pollTarget(ctx, target))
+		start := time.Now()
+		err := e.pollTarget(ctx, target)
+		observeScrape(time.Since(start), err)
+		e.recordResult(target, err)
+	}
+	e.mu.Lock()
+	e.lastPoll = e.now()
+	e.mu.Unlock()
+}
+
+// observeScrape records one poll's latency. Shutdown is not a scrape outcome.
+func observeScrape(d time.Duration, err error) {
+	switch {
+	case err == nil:
+		metrics.ScrapeDuration.WithLabelValues(metrics.ResultOK).Observe(d.Seconds())
+	case !errors.Is(err, context.Canceled):
+		metrics.ScrapeDuration.WithLabelValues(metrics.ResultError).Observe(d.Seconds())
 	}
 }
 
@@ -229,7 +257,7 @@ func (e *Engine) pollTarget(ctx context.Context, target string) error {
 		return &outboxError{fmt.Errorf("detect: %w", err)}
 	}
 	if baselined {
-		log.Printf("scraper: %s baselined at %d existing chapter(s); not announcing them", target, len(chapters))
+		slog.Info("scraper: baselined target", "target", target, "chapters", len(chapters))
 		return nil
 	}
 
@@ -251,12 +279,16 @@ func (e *Engine) pollTarget(ctx context.Context, target string) error {
 			return nil
 		}
 		if err := e.PostToWebhook(ctx, ch); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				metrics.WebhookFailures.Inc()
+			}
 			return fmt.Errorf("webhook ch.%s (stays pending): %w", ch.Number, err)
 		}
 		if err := e.ack(ctx, ch); err != nil {
 			return &outboxError{fmt.Errorf("ack ch.%s: %w", ch.Number, err)}
 		}
-		log.Printf("scraper: announced %s ch.%s", target, ch.Number)
+		metrics.ChaptersAnnounced.Inc()
+		slog.Info("scraper: announced chapter", "target", target, "chapter", ch.Number)
 	}
 	return nil
 }

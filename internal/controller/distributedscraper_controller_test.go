@@ -3,6 +3,7 @@ package controller
 import (
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	infrav1 "github.com/affinity/distriscrape/api/v1"
@@ -115,7 +116,38 @@ func TestDesiredServiceHeadless(t *testing.T) {
 	if svc.Spec.ClusterIP != "None" {
 		t.Fatalf("expected headless service, clusterIP=%q", svc.Spec.ClusterIP)
 	}
-	if len(svc.Spec.Ports) != 2 || svc.Spec.Ports[0].Port != workerPort || svc.Spec.Ports[1].Port != workerAPIPort {
+	if len(svc.Spec.Ports) != 3 || svc.Spec.Ports[0].Port != workerPort || svc.Spec.Ports[1].Port != workerAPIPort ||
+		svc.Spec.Ports[2].Port != workerHealthPort {
 		t.Fatalf("unexpected ports: %+v", svc.Spec.Ports)
+	}
+}
+
+func TestDesiredStatefulSetObservability(t *testing.T) {
+	scraper := &infrav1.DistributedScraper{
+		ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "default"},
+		Spec:       infrav1.DistributedScraperSpec{WorkerNodes: 3},
+	}
+	sts := desiredStatefulSet(scraper)
+	c := sts.Spec.Template.Spec.Containers[0]
+
+	// Liveness ignores Raft, readiness follows it; mixing them up would have
+	// Kubernetes restart pods during an election.
+	if c.LivenessProbe == nil || c.LivenessProbe.HTTPGet.Path != "/healthz" {
+		t.Errorf("liveness probe = %+v, want /healthz", c.LivenessProbe)
+	}
+	if c.ReadinessProbe == nil || c.ReadinessProbe.HTTPGet.Path != "/readyz" ||
+		c.ReadinessProbe.HTTPGet.Port.IntValue() != workerHealthPort {
+		t.Errorf("readiness probe = %+v, want /readyz on %d", c.ReadinessProbe, workerHealthPort)
+	}
+
+	// Ordered startup would deadlock: pod 1 waits for pod 0 to be Ready, which
+	// needs a leader, which needs a quorum of running pods.
+	if sts.Spec.PodManagementPolicy != appsv1.ParallelPodManagement {
+		t.Errorf("PodManagementPolicy = %q, want Parallel", sts.Spec.PodManagementPolicy)
+	}
+
+	ann := sts.Spec.Template.Annotations
+	if ann["prometheus.io/scrape"] != "true" || ann["prometheus.io/port"] != "8080" || ann["prometheus.io/path"] != "/metrics" {
+		t.Errorf("prometheus annotations = %v", ann)
 	}
 }
