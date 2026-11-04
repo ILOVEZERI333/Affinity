@@ -6,15 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
+	"log"
 	"net/http"
 	"os"
-	"slices"
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/affinity/distriscrape/internal/metrics"
 )
 
 const (
@@ -138,7 +135,7 @@ func (p *Placer) Reconcile(ctx context.Context) {
 	if err != nil {
 		// Keep the current assignments rather than treating an unreadable file
 		// as "no targets", which would make every worker stop scraping.
-		slog.Error("placement: read targets failed", "err", err)
+		log.Printf("placement: read targets: %v", err)
 		return
 	}
 
@@ -190,39 +187,25 @@ func (p *Placer) Reconcile(ctx context.Context) {
 func (p *Placer) pushTo(ctx context.Context, node, raftAddr string, epoch uint64, targets []string) bool {
 	err := p.push(ctx, raftAddr, handoffRequest{Epoch: epoch, Targets: targets})
 	if err != nil {
-		slog.Warn("placement: handoff failed", "peer", node, "epoch", epoch, "err", err)
+		log.Printf("placement: handoff to %s (epoch %d): %v", node, epoch, err)
 		return false
 	}
 	if prev, ok := p.pushed[node]; !ok || !sameSet(prev.targets, targets) {
-		slog.Info("placement: assignment pushed", "peer", node, "targets", len(targets), "epoch", epoch)
+		log.Printf("placement: %s now owns %d target(s) at epoch %d", node, len(targets), epoch)
 	}
 	p.pushed[node] = pushedState{targets: targets, at: time.Now()}
 	return true
 }
 
 // syncRing makes the ring's members equal the Raft voters.
-//
-// Every change after the ring was first populated counts as a rebalance. The
-// first population is not one: a leader starts with an empty ring, so filling
-// it at election time would otherwise inflate the count on every failover.
 func (p *Placer) syncRing(members map[string]string) {
-	before := p.ring.Members()
-	changed := false
-	for _, existing := range before {
+	for _, existing := range p.ring.Members() {
 		if _, ok := members[existing]; !ok {
 			p.ring.RemoveNode(existing)
-			changed = true
 		}
 	}
 	for id := range members {
-		if !slices.Contains(before, id) {
-			p.ring.AddNode(id)
-			changed = true
-		}
-	}
-	if changed && len(before) > 0 {
-		metrics.RingRebalances.Inc()
-		slog.Info("placement: ring rebalanced", "members", len(members))
+		p.ring.AddNode(id)
 	}
 }
 
