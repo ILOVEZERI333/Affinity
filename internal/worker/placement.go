@@ -192,18 +192,28 @@ func (p *Placer) Reconcile(ctx context.Context) {
 		p.lastEpoch = epoch
 	}
 
-	// Forget bookkeeping for nodes that left the ring, and their committed
-	// ownership with it.
+	// Clear committed ownership of nodes that left the ring. Candidates come from
+	// the FSM as well as p.pushed, so a new leader (empty p.pushed) still cleans
+	// up. Bookkeeping is kept until the clear commits, so a failure is retried.
+	stale := map[string]bool{}
 	for id := range p.pushed {
-		if _, ok := desired[id]; !ok {
-			delete(p.pushed, id)
-			p.mu.Lock()
-			delete(p.handoffs, id)
-			p.mu.Unlock()
-			if err := p.raft.CommitAssignment(id, epoch, nil); err != nil {
-				slog.Error("clear assignment failed", "action", "assign", "status", "error", "node", id, "epoch", epoch, "error", err)
-			}
+		stale[id] = true
+	}
+	for _, id := range p.raft.OwnerNodes() {
+		stale[id] = true
+	}
+	for id := range stale {
+		if _, ok := desired[id]; ok {
+			continue
 		}
+		if err := p.raft.CommitAssignment(id, epoch, nil); err != nil {
+			slog.Error("clear assignment failed", "action", "assign", "status", "error", "node", id, "epoch", epoch, "error", err)
+			continue
+		}
+		delete(p.pushed, id)
+		p.mu.Lock()
+		delete(p.handoffs, id)
+		p.mu.Unlock()
 	}
 	defer func() { p.Metrics.UnownedTargets.Set(float64(p.unowned(targets))) }()
 
@@ -246,7 +256,7 @@ func (p *Placer) pushTo(ctx context.Context, node, raftAddr string, epoch uint64
 	rec := HandoffRecord{Node: node, Epoch: epoch, Targets: len(targets), SentAt: time.Now()}
 	err := p.push(ctx, raftAddr, handoffRequest{Epoch: epoch, Targets: targets})
 	if err != nil {
-		rec.Error = err.Error()
+		rec.Error = errorCategory(err)
 		p.record(rec)
 		slog.Error("handoff failed", "action", "handoff", "status", "error", "to", node, "epoch", epoch, "error", err)
 		return false
@@ -263,6 +273,19 @@ func (p *Placer) pushTo(ctx context.Context, node, raftAddr string, epoch uint64
 		slog.Error("commit assignment failed", "action", "assign", "status", "error", "node", node, "epoch", epoch, "error", err)
 	}
 	return true
+}
+
+// errorCategory is the coarse, address-free reason shown in /status; the full
+// error goes to the log.
+func errorCategory(err error) string {
+	switch {
+	case errors.Is(err, ErrStaleEpoch):
+		return "stale epoch"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		return "handoff failed"
+	}
 }
 
 // unowned counts targets no node has confirmed, by the placer's own pushes.
