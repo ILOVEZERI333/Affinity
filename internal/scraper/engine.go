@@ -7,13 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/affinity/distriscrape/internal/metrics"
 )
 
 const (
@@ -63,6 +65,9 @@ type Engine struct {
 	BackoffMax  time.Duration
 	now         func() time.Time
 
+	// Metrics receives poll, cycle and webhook measurements.
+	Metrics *metrics.M
+
 	WebhookURL string
 	// SourceURL is the per-target chapter-list endpoint; "{target}" is replaced
 	// with the target ID. The endpoint must return a JSON array of
@@ -81,6 +86,7 @@ func NewEngine(webhookURL string) *Engine {
 		BackoffBase: 5 * time.Second,
 		BackoffMax:  10 * time.Minute,
 		now:         time.Now,
+		Metrics:     metrics.New("", ""),
 		WebhookURL:  webhookURL,
 		HTTPClient:  &http.Client{Timeout: 10 * time.Second},
 	}
@@ -156,7 +162,7 @@ func (e *Engine) recordResult(target string, err error) {
 	delay := e.backoffDelay(st.fails)
 	st.next = e.now().Add(delay)
 	e.retry[target] = st
-	log.Printf("scraper: %s: %v (failure %d, next try in %s)", target, err, st.fails, delay)
+	slog.Warn("poll failed", "action", "poll", "status", "backoff", "target", target, "error", err, "failures", st.fails, "retry_in", delay.String())
 }
 
 func (e *Engine) owns(target string) bool {
@@ -192,6 +198,8 @@ func (e *Engine) pollAll(ctx context.Context) {
 	e.mu.Unlock()
 	sort.Strings(targets)
 
+	start := e.now()
+	defer func() { e.Metrics.CycleDuration.Observe(e.now().Sub(start).Seconds()) }()
 	for _, target := range targets {
 		if ctx.Err() != nil {
 			return
@@ -199,7 +207,10 @@ func (e *Engine) pollAll(ctx context.Context) {
 		if e.backingOff(target) {
 			continue
 		}
-		e.recordResult(target, e.pollTarget(ctx, target))
+		polled := e.now()
+		err := e.pollTarget(ctx, target)
+		e.Metrics.PollDuration.WithLabelValues(target).Observe(e.now().Sub(polled).Seconds())
+		e.recordResult(target, err)
 	}
 }
 
@@ -229,7 +240,7 @@ func (e *Engine) pollTarget(ctx context.Context, target string) error {
 		return &outboxError{fmt.Errorf("detect: %w", err)}
 	}
 	if baselined {
-		log.Printf("scraper: %s baselined at %d existing chapter(s); not announcing them", target, len(chapters))
+		slog.Info("target baselined", "action", "baseline", "status", "ok", "target", target, "chapters", len(chapters))
 		return nil
 	}
 
@@ -251,12 +262,14 @@ func (e *Engine) pollTarget(ctx context.Context, target string) error {
 			return nil
 		}
 		if err := e.PostToWebhook(ctx, ch); err != nil {
+			e.Metrics.WebhookFailures.WithLabelValues(target).Inc()
 			return fmt.Errorf("webhook ch.%s (stays pending): %w", ch.Number, err)
 		}
+		e.Metrics.ReleaseToWebhook.WithLabelValues(target).Observe(e.now().Sub(ch.Seen).Seconds())
 		if err := e.ack(ctx, ch); err != nil {
 			return &outboxError{fmt.Errorf("ack ch.%s: %w", ch.Number, err)}
 		}
-		log.Printf("scraper: announced %s ch.%s", target, ch.Number)
+		slog.Info("chapter announced", "action", "announce", "status", "ok", "target", target, "chapter", ch.Number)
 	}
 	return nil
 }
