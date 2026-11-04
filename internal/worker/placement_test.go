@@ -171,6 +171,14 @@ func TestPlacementRebalancesOnMembershipChange(t *testing.T) {
 	eventually(t, 15*time.Second, "every target owned by exactly one node", func() bool {
 		return ownedOnce(nodes, targets)
 	})
+	eventually(t, 10*time.Second, "owners committed to the Raft log on every node", func() bool {
+		for _, n := range nodes {
+			if len(n.raft.Owners()) != len(targets) {
+				return false
+			}
+		}
+		return true
+	})
 
 	// Kill a follower (so the leader that placed work survives and the test
 	// stays about rebalancing, not election). Its targets must move.
@@ -190,5 +198,22 @@ func TestPlacementRebalancesOnMembershipChange(t *testing.T) {
 			}
 		}
 		return ownedOnce(nodes, targets)
+	})
+	eventually(t, 10*time.Second, "committed owners point only at survivors", func() bool {
+		for _, n := range nodes {
+			if n == nil {
+				continue
+			}
+			owners := n.raft.Owners()
+			if len(owners) != len(targets) {
+				return false
+			}
+			for _, o := range owners {
+				if o == ids[victim] {
+					return false
+				}
+			}
+		}
+		return true
 	})
 }

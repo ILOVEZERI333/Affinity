@@ -19,7 +19,7 @@ const (
 	workerImage         = "distriscrape-worker:latest"
 	workerPort          = 7946
 	workerAPIPort       = 7947 // peer API (join/handoff); Raft's port + 1
-	workerHealthPort    = 8080 // liveness probe (/healthz)
+	workerHealthPort    = 8080 // /healthz, /readyz, /metrics
 	raftDataVolumeName  = "raft-data"
 	raftDataMountPath   = "/data/raft"
 	raftDataStorageSize = "1Gi"
@@ -57,6 +57,16 @@ func peerAddresses(scraper *infrav1.DistributedScraper) []string {
 		addrs = append(addrs, fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:%d", svc, i, svc, scraper.Namespace, workerPort))
 	}
 	return addrs
+}
+
+// peerAPIURLs returns every worker's /status URL on its peer API port.
+func peerAPIURLs(scraper *infrav1.DistributedScraper) []string {
+	svc := workersResourceName(scraper)
+	urls := make([]string, 0, scraper.Spec.WorkerNodes)
+	for i := int32(0); i < scraper.Spec.WorkerNodes; i++ {
+		urls = append(urls, fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:%d/status", svc, i, svc, scraper.Namespace, workerAPIPort))
+	}
+	return urls
 }
 
 func desiredConfigMap(scraper *infrav1.DistributedScraper) *corev1.ConfigMap {
@@ -127,6 +137,11 @@ func desiredStatefulSet(scraper *infrav1.DistributedScraper) *appsv1.StatefulSet
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: podLabels,
+					Annotations: map[string]string{
+						"prometheus.io/scrape": "true",
+						"prometheus.io/port":   fmt.Sprint(workerHealthPort),
+						"prometheus.io/path":   "/metrics",
+					},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -151,6 +166,7 @@ func desiredStatefulSet(scraper *infrav1.DistributedScraper) *appsv1.StatefulSet
 										},
 									},
 								},
+								{Name: "CLUSTER_ID", Value: scraper.Namespace + "/" + scraper.Name},
 								{Name: "BIND_ADDR", Value: ":7946"},
 								{Name: "DATA_DIR", Value: raftDataMountPath},
 								{Name: "TARGETS_FILE", Value: targetsMountPath + "/" + targetsConfigKey},
@@ -171,6 +187,18 @@ func desiredStatefulSet(scraper *infrav1.DistributedScraper) *appsv1.StatefulSet
 								InitialDelaySeconds: 5,
 								PeriodSeconds:       5,
 								FailureThreshold:    3,
+							},
+							// Readiness is the worker's own view: a leader is known and
+							// its synthetic probe passes. Mid-election it drops out.
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/readyz",
+										Port: intstr.FromInt(workerHealthPort),
+									},
+								},
+								PeriodSeconds:    5,
+								FailureThreshold: 2,
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
