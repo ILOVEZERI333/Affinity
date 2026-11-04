@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -114,6 +115,9 @@ func (c *OutboxClient) submit(ctx context.Context, cmd command) (scraper.Deliver
 			if errors.Is(err, ErrNotLeader) {
 				continue
 			}
+			if errors.Is(err, ErrStaleEpoch) {
+				logFenced(cmd, c.node.Epoch())
+			}
 			return state, err
 		}
 		addr := hint
@@ -208,8 +212,15 @@ func (s *Server) handleOutbox(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrNotLeader):
 		notLeader()
 	case errors.Is(err, ErrStaleEpoch):
+		logFenced(cmd, s.raft.Epoch())
 		http.Error(w, err.Error(), http.StatusConflict)
 	default:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// logFenced records a write rejected by epoch fencing: the zombie-tab event.
+func logFenced(cmd command, current uint64) {
+	slog.Warn("write fenced", "action", "fence", "status", "rejected", "type", cmd.Type,
+		"target", cmd.Target, "chapter", cmd.Number, "writer_epoch", cmd.Epoch, "ring_epoch", current)
 }

@@ -6,7 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -34,6 +35,10 @@ const (
 	deadVoterCheckInterval = time.Second
 
 	cmdBumpEpoch = "bump_epoch"
+
+	// cmdAssign records that a node confirmed it owns a set of targets (the
+	// leader commits it after a handoff succeeds). Leader-only, fenced by epoch.
+	cmdAssign = "assign"
 
 	// Outbox commands (Phase 8). They carry the writer's ring epoch and are
 	// fenced against the replicated one inside the FSM.
@@ -118,7 +123,7 @@ func NewRaftNode(cfg RaftNodeConfig) (*RaftNode, error) {
 		return nil, fmt.Errorf("raft: open snapshot store: %w", err)
 	}
 
-	fsm := &ringFSM{outbox: scraper.NewOutboxState()}
+	fsm := &ringFSM{outbox: scraper.NewOutboxState(), owners: map[string]ownership{}}
 	r, err := raft.NewRaft(rc, fsm, logStore, logStore, snapshots, trans)
 	if err != nil {
 		_ = logStore.Close()
@@ -296,6 +301,28 @@ func (n *RaftNode) Epoch() uint64 {
 	return n.fsm.Epoch()
 }
 
+// Owners returns the replicated target -> confirmed owner map.
+func (n *RaftNode) Owners() map[string]string { return n.fsm.Owners() }
+
+// CommitAssignment records, through the log, that node confirmed owning targets
+// at epoch. Only the leader may call it.
+func (n *RaftNode) CommitAssignment(node string, epoch uint64, targets []string) error {
+	b, err := json.Marshal(command{Type: cmdAssign, Node: node, Epoch: epoch, Targets: targets})
+	if err != nil {
+		return err
+	}
+	return n.Apply(b, raftTimeout)
+}
+
+// Stats returns hashicorp/raft's own counters (term, commit_index, ...).
+func (n *RaftNode) Stats() map[string]string { return n.raft.Stats() }
+
+// LeaderID returns the current leader's node ID, or "" if none is known.
+func (n *RaftNode) LeaderID() string {
+	_, id := n.raft.LeaderWithID()
+	return string(id)
+}
+
 // LeaderCh notifies observers of leadership changes for as long as ctx is
 // alive, mirroring raft.Raft's LeaderCh but scoped to a context so callers
 // can clean up.
@@ -418,10 +445,10 @@ func (n *RaftNode) monitorDeadVoters(ctx context.Context) {
 					continue
 				}
 				if err := n.Leave(string(id)); err != nil {
-					log.Printf("raft: removing dead voter %s: %v", id, err)
+					slog.Error("remove dead voter failed", "action", "evict", "status", "error", "voter", id, "error", err)
 					continue
 				}
-				log.Printf("raft: removed dead voter %s (no heartbeat for %s)", id, time.Since(since).Round(time.Millisecond))
+				slog.Warn("dead voter removed", "action", "evict", "status", "ok", "voter", id, "silent_for", time.Since(since).Round(time.Millisecond).String())
 				delete(downSince, id)
 			}
 		}
@@ -462,6 +489,10 @@ type command struct {
 	URL    string `json:"url,omitempty"`
 	Title  string `json:"title,omitempty"`
 	Epoch  uint64 `json:"epoch,omitempty"`
+
+	// cmdAssign only: the node and the complete set of targets it confirmed.
+	Node    string   `json:"node,omitempty"`
+	Targets []string `json:"targets,omitempty"`
 }
 
 // ringFSM applies committed log entries to local in-memory state on every
@@ -474,6 +505,14 @@ type ringFSM struct {
 	mu     sync.RWMutex
 	epoch  uint64
 	outbox *scraper.OutboxState
+	owners map[string]ownership // node ID -> targets it confirmed
+}
+
+// ownership is one node's confirmed target set and the ring epoch it was
+// confirmed at.
+type ownership struct {
+	Targets []string `json:"targets"`
+	Epoch   uint64   `json:"epoch"`
 }
 
 var _ raft.FSM = (*ringFSM)(nil)
@@ -498,6 +537,18 @@ func (f *ringFSM) Apply(l *raft.Log) interface{} {
 		defer f.mu.Unlock()
 		f.epoch++
 		return f.epoch
+	case cmdAssign:
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if cmd.Epoch < f.epoch {
+			return ErrStaleEpoch
+		}
+		if len(cmd.Targets) == 0 {
+			delete(f.owners, cmd.Node)
+		} else {
+			f.owners[cmd.Node] = ownership{Targets: cmd.Targets, Epoch: cmd.Epoch}
+		}
+		return nil
 	case cmdOutboxBaseline, cmdOutboxEnqueue, cmdOutboxAck:
 		return f.applyOutbox(cmd)
 	default:
@@ -552,10 +603,28 @@ func (f *ringFSM) HighWater(target string) (float64, bool) {
 	return f.outbox.HighWater(target)
 }
 
+// Owners returns target -> confirmed owner. During a move the old and new owner
+// can both be listed; the higher epoch wins.
+func (f *ringFSM) Owners() map[string]string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := map[string]string{}
+	best := map[string]uint64{}
+	for node, o := range f.owners {
+		for _, t := range o.Targets {
+			if cur, ok := best[t]; !ok || o.Epoch > cur {
+				out[t], best[t] = node, o.Epoch
+			}
+		}
+	}
+	return out
+}
+
 // fsmState is the serialized form of the FSM used for snapshots.
 type fsmState struct {
-	Epoch  uint64                  `json:"epoch"`
+	Epoch  uint64                 `json:"epoch"`
 	Outbox scraper.OutboxSnapshot `json:"outbox"`
+	Owners map[string]ownership   `json:"owners,omitempty"`
 }
 
 // Snapshot returns an FSMSnapshot used to: support log compaction, so a
@@ -564,7 +633,7 @@ type fsmState struct {
 func (f *ringFSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return &fsmSnapshot{state: fsmState{Epoch: f.epoch, Outbox: f.outbox.Snapshot()}}, nil
+	return &fsmSnapshot{state: fsmState{Epoch: f.epoch, Outbox: f.outbox.Snapshot(), Owners: maps.Clone(f.owners)}}, nil
 }
 
 // Restore is used to restore an FSM from a snapshot, e.g. on node restart.
@@ -577,6 +646,10 @@ func (f *ringFSM) Restore(snapshot io.ReadCloser) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.epoch = state.Epoch
+	f.owners = state.Owners
+	if f.owners == nil {
+		f.owners = map[string]ownership{}
+	}
 	f.outbox.Restore(state.Outbox)
 	return nil
 }
