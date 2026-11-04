@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/affinity/distriscrape/internal/metrics"
 	"github.com/affinity/distriscrape/internal/scraper"
 	"github.com/affinity/distriscrape/internal/worker"
 )
@@ -18,6 +19,7 @@ import (
 // Config is read from the environment. The operator sets these on the
 // worker StatefulSet's pod template from the DistributedScraper spec.
 type Config struct {
+	ClusterID        string // CR namespace/name, stamped on every log line and metric
 	NodeID           string // usually the pod name (ordinal-stable via StatefulSet)
 	BindAddr         string // Raft transport listen address
 	AdvertiseAddr    string // stable address peers use to reach this node's Raft transport
@@ -35,12 +37,12 @@ type Config struct {
 func loadConfig() Config {
 	interval, err := time.ParseDuration(getenv("SYNC_INTERVAL", "30s"))
 	if err != nil {
-		log.Fatalf("invalid SYNC_INTERVAL: %v", err)
+		fatal("invalid SYNC_INTERVAL", err)
 	}
 
 	deadVoterTimeout, err := time.ParseDuration(getenv("DEAD_VOTER_TIMEOUT", worker.DefaultDeadVoterTimeout.String()))
 	if err != nil {
-		log.Fatalf("invalid DEAD_VOTER_TIMEOUT: %v", err)
+		fatal("invalid DEAD_VOTER_TIMEOUT", err)
 	}
 
 	var peers []string
@@ -52,6 +54,7 @@ func loadConfig() Config {
 	bindAddr := getenv("BIND_ADDR", ":7946")
 
 	return Config{
+		ClusterID:        getenv("CLUSTER_ID", "local"),
 		NodeID:           nodeID,
 		BindAddr:         bindAddr,
 		AdvertiseAddr:    getenv("ADVERTISE_ADDR", advertiseAddrFor(nodeID, bindAddr, peers)),
@@ -82,6 +85,22 @@ func advertiseAddrFor(nodeID, bindAddr string, peers []string) string {
 		return bindAddr
 	}
 	return net.JoinHostPort("localhost", port)
+}
+
+// fatal logs a startup error and exits.
+func fatal(msg string, err error) {
+	slog.Error(msg, "action", "startup", "status", "error", "error", err)
+	os.Exit(1)
+}
+
+// setupLogging makes structured logs (JSON unless LOG_FORMAT=text) the default,
+// stamping node and cluster on every line.
+func setupLogging(cluster, node string) {
+	var h slog.Handler = slog.NewJSONHandler(os.Stderr, nil)
+	if os.Getenv("LOG_FORMAT") == "text" {
+		h = slog.NewTextHandler(os.Stderr, nil)
+	}
+	slog.SetDefault(slog.New(h).With("cluster", cluster, "node", node))
 }
 
 func getenv(key, fallback string) string {
@@ -133,18 +152,20 @@ func maintainMembership(ctx context.Context, n *worker.RaftNode, cfg Config, sto
 			stopScraping()
 		}
 		if err := worker.JoinCluster(ctx, cfg.PeerAddrs, cfg.NodeID, cfg.AdvertiseAddr); err != nil {
-			log.Printf("join cluster: %v", err)
+			slog.Warn("join failed", "action", "join", "status", "error", "error", err)
 			continue
 		}
-		log.Printf("joined cluster as %s", cfg.NodeID)
+		slog.Info("joined cluster", "action", "join", "status", "ok")
 	}
 }
 
 func main() {
 	cfg := loadConfig()
+	setupLogging(cfg.ClusterID, cfg.NodeID)
 	if cfg.NodeID == "" {
-		log.Fatal("NODE_ID (or POD_NAME) must be set")
+		fatal("NODE_ID (or POD_NAME) must be set", nil)
 	}
+	m := metrics.New(cfg.ClusterID, cfg.NodeID)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -164,11 +185,11 @@ func main() {
 		DeadVoterTimeout: cfg.DeadVoterTimeout,
 	})
 	if err != nil {
-		log.Fatalf("failed to start raft node: %v", err)
+		fatal("failed to start raft node", err)
 	}
 	defer func() {
 		if err := raftNode.Shutdown(); err != nil {
-			log.Printf("raft shutdown: %v", err)
+			slog.Error("raft shutdown failed", "action", "shutdown", "status", "error", "error", err)
 		}
 	}()
 
@@ -177,7 +198,9 @@ func main() {
 	ring := worker.NewHashRing(64)
 
 	peerServer := worker.NewServer(cfg.APIBindAddr, raftNode, ring)
+	peerServer.SetMetrics(m)
 	engine := scraper.NewEngine(cfg.WebhookURL)
+	engine.Metrics = m
 	engine.SourceURL = cfg.SourceURL
 	// Delivery state (pending notifications and high-water marks) is replicated
 	// through Raft, so it follows a target when the ring moves it and survives
@@ -188,11 +211,16 @@ func main() {
 	// only the leader runs the placer that sends them.
 	peerServer.SetTargetSink(engine.SetTargets)
 	placer := worker.NewPlacer(raftNode, ring, worker.FileTargets(cfg.TargetsFile))
+	placer.Metrics = m
+	peerServer.Placer = placer
+	prober := worker.NewProber(worker.SelfCheck(cfg.APIBindAddr), m)
+	peerServer.Prober = prober
 	go placer.Run(ctx)
+	go prober.Run(ctx, worker.ProbeInterval)
 
 	go func() {
 		if err := peerServer.ListenAndServe(ctx); err != nil {
-			log.Printf("peer server stopped: %v", err)
+			slog.Error("peer server stopped", "action", "serve", "status", "error", "error", err)
 		}
 	}()
 
@@ -201,7 +229,7 @@ func main() {
 	// the probe to it would make Kubernetes restart healthy pods during an election.
 	healthSrv := &http.Server{
 		Addr:              getenv("HEALTH_ADDR", ":8080"),
-		Handler:           worker.LivenessHandler(),
+		Handler:           worker.HealthHandler(func() bool { return peerServer.Status().Ready() }, m.Handler()),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	healthErr := make(chan error, 1)
@@ -216,15 +244,18 @@ func main() {
 	}()
 
 	go engine.Run(ctx, cfg.SyncInterval)
-	go maintainMembership(ctx, raftNode, cfg, func() { engine.SetTargets(nil) })
+	go maintainMembership(ctx, raftNode, cfg, func() {
+		slog.Warn("cut off from leader; dropping targets", "action", "zombie_stop", "status", "ok")
+		engine.SetTargets(nil)
+	})
 
-	log.Printf("worker %s ready (bind=%s)", cfg.NodeID, cfg.BindAddr)
+	slog.Info("worker ready", "action", "start", "status", "ok", "bind", cfg.BindAddr)
 	select {
 	case <-ctx.Done():
 	case err := <-healthErr:
 		// Without a probe target Kubernetes would kill the pod anyway; exit visibly.
-		log.Printf("health server failed: %v", err)
+		slog.Error("health server failed", "action", "serve", "status", "error", "error", err)
 		exitCode = 1
 	}
-	log.Println("worker shutting down")
+	slog.Info("worker shutting down", "action", "shutdown", "status", "ok")
 }

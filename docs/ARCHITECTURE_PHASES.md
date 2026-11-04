@@ -320,7 +320,7 @@ go test ./internal/worker/...
 | Drop-before-pick-up | `Placer.Reconcile` | Nodes losing targets are told first; if one is unreachable, gainers wait. Brief under-scrape beats double-scrape. |
 | Anti-entropy | `resyncInterval` (10s) | Assignments are re-sent so a restarted worker (empty engine, still a voter) heals. |
 
-**Known limits:** fencing is in-memory, so a restarted worker accepts any epoch until Phase 8 ties epochs to the outbox; an evicted-but-alive node (zombie) is never told to stop; that is Phase 9. `TargetsAssigned` CR condition is not set yet (Phase 10).
+**Known limits:** fencing is in-memory, so a restarted worker accepts any epoch until Phase 8 ties epochs to the outbox; an evicted-but-alive node (zombie) is never told to stop; that is Phase 9. `TargetsAssigned` is set in Phase 10.
 
 **Proof of done:**
 
@@ -440,16 +440,24 @@ go test ./internal/scraper/... ./internal/worker/...
 
 ---
 
-## Phase 10 — Observability and Ops
+## Phase 10 — Observability and Ops ✅ Complete
 
-**After** core loop works:
+**Done when:** Prometheus shows the live series below and `kubectl get distributedscraper` shows the three conditions.
 
-- Structured logs (node, target, leader term)
-- Metrics: scrape latency, webhook failures, ring rebalance count
-- Status conditions on CR (`Ready`, `LeaderElected`, `TargetsAssigned`)
-- Health endpoints on operator and worker
+| Piece | Where | Behavior |
+| --- | --- | --- |
+| Logs | `slog` in worker, scraper, placer | JSON by default (`LOG_FORMAT=text` for text). Every line carries `cluster` (`namespace/name`), `node`, `action`, `status`; target, epoch, chapter, error where they apply. Fencing rejections and zombie self-stops are log events, not counters. |
+| Metrics | `internal/metrics`, `/metrics` on `:8080` | All series carry `cluster` and `node`. `release_to_webhook_seconds{target}` (first detection → webhook accepted; the alert driver), `poll_duration_seconds{target}`, `scrape_cycle_duration_seconds`, `webhook_failures_total`, `ring_rebalances_total`, `unowned_targets`, `targets_owned`, `ring_epoch` vs `handoff_epoch` (gap = lagging node), Raft term/commit/applied/last-log index, `raft_is_leader`, `raft_voters`, HTTP request count/latency on the peer API, `probe_consecutive_failures`. |
+| Confirmed ownership | `cmdAssign` in `ringFSM` | After a handoff succeeds the leader commits "node N owns set S at epoch E" to the Raft log (epoch-fenced; cleared when a node leaves the ring). Every node can answer target → owner. |
+| `/status` | peer API `:7947` | Each node's view: leader, term, epochs, voters, health, owned targets, owners map; the leader adds a handoff record per node (epoch, sent time, acked, error). |
+| Synthetic probe | `Prober`, every 15s | Calls the node's own `/status` and needs a known leader. Four failures in a row = unhealthy. It only reports; acting on unhealthy nodes is post-MVP. |
+| `/readyz` | worker `:8080` | Ready = leader known and probe healthy, so a node mid-election is not ready. `/healthz` is still independent of Raft. Operator serves `/healthz` and `/readyz` on `:8081`. |
+| CR conditions | `internal/controller/conditions.go` | The operator polls every worker's `/status`. `LeaderElected`: two thirds agree on a leader. `TargetsAssigned`: every target has a confirmed owner in the leader's view. `Ready`: a leader exists and more than half of workers are healthy (unowned targets do not block it). No worker reachable → all three `Unknown`. |
+| Operator backoff | `nextPoll` | Refresh every 15s while workers answer; 2s doubling to a 5 min cap while none do. `distriscrape_operator_last_status_update_timestamp_seconds` shows the last success. |
 
-Platform interviews care that you can **debug** the system, not only draw it.
+**Known limits:** release latency is measured from first detection, not the site's publish time. Prometheus must be installed separately (pods carry `prometheus.io/*` annotations). `/status` and `/metrics` are unauthenticated (Phase 11). Unhealthy nodes are only reported. A node leaderless past `DeadVoterTimeout` logs its self-stop every 3s while it stays cut off.
+
+**Proof of done:** `go test ./...` (`TestComputeConditions`, `TestProberUnhealthyAfterFourFailures`, `TestReadyzFollowsReadiness`, owner-commit assertions in the placement test). Manual: on a cluster, `curl :8080/metrics` and `kubectl get distributedscraper -o yaml`.
 
 ---
 
@@ -500,5 +508,5 @@ Skip Discord polish and multi-source parsers until week 3's path works with a st
 | 7 — Execution (Scrape Loop) | ✅ Complete |
 | 8 — Delivery and Idempotency | ✅ Complete |
 | 9 — Failure Detection and Recovery | 🟡 Liveness probe added; zombie stop-signal open |
-| 10 — Observability and Ops | 🔲 |
+| 10 — Observability and Ops | ✅ Complete |
 | 11 — Hardening | 🔲 |
