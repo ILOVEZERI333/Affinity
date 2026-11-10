@@ -197,14 +197,20 @@ func (p *Placer) Reconcile(ctx context.Context) {
 	for id := range p.pushed {
 		if _, ok := desired[id]; !ok {
 			delete(p.pushed, id)
-			p.mu.Lock()
-			delete(p.handoffs, id)
-			p.mu.Unlock()
 			if err := p.raft.CommitAssignment(id, epoch, nil); err != nil {
 				slog.Error("clear assignment failed", "action", "assign", "status", "error", "node", id, "epoch", epoch, "error", err)
 			}
 		}
 	}
+	// Handoff records exist for nodes that never acked too, so prune them
+	// independently of p.pushed.
+	p.mu.Lock()
+	for id := range p.handoffs {
+		if _, ok := desired[id]; !ok {
+			delete(p.handoffs, id)
+		}
+	}
+	p.mu.Unlock()
 	defer func() { p.Metrics.UnownedTargets.Set(float64(p.unowned(targets))) }()
 
 	var shrinking, growing []string
@@ -246,7 +252,12 @@ func (p *Placer) pushTo(ctx context.Context, node, raftAddr string, epoch uint64
 	rec := HandoffRecord{Node: node, Epoch: epoch, Targets: len(targets), SentAt: time.Now()}
 	err := p.push(ctx, raftAddr, handoffRequest{Epoch: epoch, Targets: targets})
 	if err != nil {
-		rec.Error = err.Error()
+		// /status is exposed; err can embed the peer URL, so keep it coarse. The
+		// full error goes to the log below.
+		rec.Error = "handoff failed"
+		if errors.Is(err, ErrStaleEpoch) {
+			rec.Error = ErrStaleEpoch.Error()
+		}
 		p.record(rec)
 		slog.Error("handoff failed", "action", "handoff", "status", "error", "to", node, "epoch", epoch, "error", err)
 		return false
