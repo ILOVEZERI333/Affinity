@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/affinity/distriscrape/internal/metrics"
 )
 
 const (
@@ -64,6 +67,16 @@ func FileTargets(path string) func() ([]string, error) {
 	}
 }
 
+// HandoffRecord is the leader's latest handoff attempt to one node, for /status.
+type HandoffRecord struct {
+	Node    string    `json:"node"`
+	Epoch   uint64    `json:"epoch"`
+	Targets int       `json:"targets"`
+	SentAt  time.Time `json:"sentAt"`
+	Acked   bool      `json:"acked"`
+	Error   string    `json:"error,omitempty"`
+}
+
 type pushedState struct {
 	targets []string
 	at      time.Time
@@ -85,6 +98,31 @@ type Placer struct {
 	interval time.Duration
 
 	pushed map[string]pushedState // node ID -> last successfully pushed set
+
+	// Metrics is replaced by the worker's shared instruments.
+	Metrics *metrics.M
+
+	mu        sync.Mutex
+	handoffs  map[string]HandoffRecord
+	lastEpoch uint64
+}
+
+// Handoffs returns the latest handoff record per node (empty on a follower).
+func (p *Placer) Handoffs() []HandoffRecord {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]HandoffRecord, 0, len(p.handoffs))
+	for _, h := range p.handoffs {
+		out = append(out, h)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Node < out[j].Node })
+	return out
+}
+
+func (p *Placer) record(h HandoffRecord) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.handoffs[h.Node] = h
 }
 
 // NewPlacer wires a Placer to a Raft node and ring. targets supplies the
@@ -100,6 +138,8 @@ func NewPlacer(raftNode *RaftNode, ring *HashRing, targets func() ([]string, err
 		},
 		interval: DefaultPlaceInterval,
 		pushed:   map[string]pushedState{},
+		handoffs: map[string]HandoffRecord{},
+		Metrics:  metrics.New("", ""),
 	}
 }
 
@@ -125,6 +165,10 @@ func (p *Placer) Reconcile(ctx context.Context) {
 		// become leader later we re-send everything instead of trusting stale
 		// bookkeeping.
 		p.pushed = map[string]pushedState{}
+		p.mu.Lock()
+		p.handoffs = map[string]HandoffRecord{}
+		p.mu.Unlock()
+		p.Metrics.UnownedTargets.Set(0)
 		return
 	}
 
@@ -135,19 +179,43 @@ func (p *Placer) Reconcile(ctx context.Context) {
 	if err != nil {
 		// Keep the current assignments rather than treating an unreadable file
 		// as "no targets", which would make every worker stop scraping.
-		log.Printf("placement: read targets: %v", err)
+		slog.Error("read targets failed", "action", "place", "status", "error", "error", err)
 		return
 	}
 
 	desired := p.ring.Assign(targets)
 	epoch := p.raft.Epoch()
-
-	// Forget bookkeeping for nodes that left the ring.
-	for id := range p.pushed {
-		if _, ok := desired[id]; !ok {
-			delete(p.pushed, id)
+	if epoch != p.lastEpoch {
+		if p.lastEpoch != 0 {
+			p.Metrics.RingRebalances.Inc()
 		}
+		p.lastEpoch = epoch
 	}
+
+	// Clear committed ownership of nodes that left the ring. Candidates come from
+	// the FSM as well as p.pushed, so a new leader (empty p.pushed) still cleans
+	// up. Bookkeeping is kept until the clear commits, so a failure is retried.
+	stale := map[string]bool{}
+	for id := range p.pushed {
+		stale[id] = true
+	}
+	for _, id := range p.raft.OwnerNodes() {
+		stale[id] = true
+	}
+	for id := range stale {
+		if _, ok := desired[id]; ok {
+			continue
+		}
+		if err := p.raft.CommitAssignment(id, epoch, nil); err != nil {
+			slog.Error("clear assignment failed", "action", "assign", "status", "error", "node", id, "epoch", epoch, "error", err)
+			continue
+		}
+		delete(p.pushed, id)
+		p.mu.Lock()
+		delete(p.handoffs, id)
+		p.mu.Unlock()
+	}
+	defer func() { p.Metrics.UnownedTargets.Set(float64(p.unowned(targets))) }()
 
 	var shrinking, growing []string
 	for node, want := range desired {
@@ -185,16 +253,56 @@ func (p *Placer) Reconcile(ctx context.Context) {
 }
 
 func (p *Placer) pushTo(ctx context.Context, node, raftAddr string, epoch uint64, targets []string) bool {
+	rec := HandoffRecord{Node: node, Epoch: epoch, Targets: len(targets), SentAt: time.Now()}
 	err := p.push(ctx, raftAddr, handoffRequest{Epoch: epoch, Targets: targets})
 	if err != nil {
-		log.Printf("placement: handoff to %s (epoch %d): %v", node, epoch, err)
+		rec.Error = errorCategory(err)
+		p.record(rec)
+		slog.Error("handoff failed", "action", "handoff", "status", "error", "to", node, "epoch", epoch, "error", err)
 		return false
 	}
+	rec.Acked = true
+	p.record(rec)
 	if prev, ok := p.pushed[node]; !ok || !sameSet(prev.targets, targets) {
-		log.Printf("placement: %s now owns %d target(s) at epoch %d", node, len(targets), epoch)
+		slog.Info("handoff acked", "action", "handoff", "status", "ok", "to", node, "targets", len(targets), "epoch", epoch)
 	}
 	p.pushed[node] = pushedState{targets: targets, at: time.Now()}
+	// The owner confirmed receipt; make that fact durable. A failure here is
+	// retried by the next resync, so it only costs a log line.
+	if err := p.raft.CommitAssignment(node, epoch, targets); err != nil {
+		slog.Error("commit assignment failed", "action", "assign", "status", "error", "node", node, "epoch", epoch, "error", err)
+	}
 	return true
+}
+
+// errorCategory is the coarse, address-free reason shown in /status; the full
+// error goes to the log.
+func errorCategory(err error) string {
+	switch {
+	case errors.Is(err, ErrStaleEpoch):
+		return "stale epoch"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		return "handoff failed"
+	}
+}
+
+// unowned counts targets no node has confirmed, by the placer's own pushes.
+func (p *Placer) unowned(targets []string) int {
+	owned := map[string]bool{}
+	for _, st := range p.pushed {
+		for _, t := range st.targets {
+			owned[t] = true
+		}
+	}
+	n := 0
+	for _, t := range targets {
+		if !owned[t] {
+			n++
+		}
+	}
+	return n
 }
 
 // syncRing makes the ring's members equal the Raft voters.

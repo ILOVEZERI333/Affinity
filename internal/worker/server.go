@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/affinity/distriscrape/internal/metrics"
 )
 
 const (
@@ -59,6 +62,11 @@ type Server struct {
 	handoffEpoch uint64   // highest ring epoch a handoff has been accepted at
 	owned        []string // targets this node currently owns
 	sink         func(targets []string)
+
+	// Optional wiring, set by the worker's main after construction.
+	Placer  *Placer
+	Prober  *Prober
+	Metrics *metrics.M
 }
 
 // SetTargetSink registers the callback that applies an accepted assignment,
@@ -88,7 +96,7 @@ func (s *Server) Owned() []string {
 // NewServer constructs a peer server backed by the given Raft node and hash
 // ring, both of which the RPC handlers below read/mutate.
 func NewServer(addr string, raftNode *RaftNode, ring *HashRing) *Server {
-	return &Server{Addr: addr, raft: raftNode, ring: ring}
+	return &Server{Addr: addr, raft: raftNode, ring: ring, Metrics: metrics.New("", "")}
 }
 
 // ListenAndServe binds Addr and blocks, serving peer RPCs until ctx is
@@ -98,8 +106,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("POST "+joinPath, s.handleJoin)
 	mux.HandleFunc("POST "+handoffPath, s.handleHandoff)
 	mux.HandleFunc("POST "+outboxPath, s.handleOutbox)
+	mux.HandleFunc("GET "+statusPath, s.handleStatus)
 
-	srv := &http.Server{Addr: s.Addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: s.Addr, Handler: s.instrument(mux), ReadHeaderTimeout: 5 * time.Second}
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 
@@ -179,6 +188,7 @@ func (s *Server) TaskHandoff(ctx context.Context, epoch uint64, targets []string
 	s.handoffMu.Lock()
 	defer s.handoffMu.Unlock()
 	if epoch < s.handoffEpoch {
+		slog.Warn("handoff fenced", "action", "fence", "status", "rejected", "handoff_epoch", epoch, "accepted_epoch", s.handoffEpoch)
 		return ErrStaleEpoch
 	}
 	s.handoffEpoch = epoch
