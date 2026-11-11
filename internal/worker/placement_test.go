@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -216,4 +217,48 @@ func TestPlacementRebalancesOnMembershipChange(t *testing.T) {
 		}
 		return true
 	})
+}
+
+// A handoff record for a node that never acked is not in p.pushed, so it must
+// still be pruned once the node leaves the ring.
+func TestReconcilePrunesHandoffsForDepartedNodes(t *testing.T) {
+	n := startNode(t, "w-0", freePorts(t, 1)[0], t.TempDir(), true)
+	t.Cleanup(n.stop)
+	eventually(t, 10*time.Second, "w-0 leader", n.raft.IsLeader)
+
+	p := NewPlacer(n.raft, n.ring, func() ([]string, error) { return []string{"a"}, nil })
+	p.push = func(context.Context, string, handoffRequest) error { return nil }
+	p.record(HandoffRecord{Node: "ghost", Error: "handoff failed"})
+
+	p.Reconcile(context.Background())
+
+	for _, h := range p.Handoffs() {
+		if h.Node == "ghost" {
+			t.Fatalf("record for departed node not pruned: %+v", p.Handoffs())
+		}
+	}
+}
+
+// /status must not leak the peer URL that transport errors embed.
+func TestPushToRecordsCoarseError(t *testing.T) {
+	p := &Placer{pushed: map[string]pushedState{}, handoffs: map[string]HandoffRecord{}}
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf(`Post "http://10.0.0.7:8080/handoff": dial tcp: refused`), ""},
+		{ErrStaleEpoch, "stale epoch"},
+	} {
+		p.push = func(context.Context, string, handoffRequest) error { return tc.err }
+		if p.pushTo(context.Background(), "w-1", "10.0.0.7:7000", 1, nil) {
+			t.Fatal("pushTo succeeded on error")
+		}
+		got := p.Handoffs()[0].Error
+		if strings.Contains(got, "10.0.0.7") {
+			t.Fatalf("error leaks peer address: %q", got)
+		}
+		if tc.want != "" && got != tc.want {
+			t.Fatalf("got %q, want %q", got, tc.want)
+		}
+	}
 }

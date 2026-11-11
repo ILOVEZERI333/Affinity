@@ -215,6 +215,15 @@ func (p *Placer) Reconcile(ctx context.Context) {
 		delete(p.handoffs, id)
 		p.mu.Unlock()
 	}
+	// Handoff records exist for nodes that never acked too, so prune them
+	// independently of p.pushed and the FSM owners.
+	p.mu.Lock()
+	for id := range p.handoffs {
+		if _, ok := desired[id]; !ok {
+			delete(p.handoffs, id)
+		}
+	}
+	p.mu.Unlock()
 	defer func() { p.Metrics.UnownedTargets.Set(float64(p.unowned(targets))) }()
 
 	var shrinking, growing []string
