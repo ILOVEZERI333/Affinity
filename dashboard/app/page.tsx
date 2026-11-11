@@ -1,49 +1,16 @@
 import Refresh from "./refresh";
+import { QUERIES, fetchNode, parseUrls, pickLeader, prom } from "../lib/cluster";
 
 export const dynamic = "force-dynamic";
-
-// Mirrors worker.NodeStatus / HandoffRecord in internal/worker.
-type Handoff = { node: string; epoch: number; targets: number; sentAt: string; acked: boolean; error?: string };
-type NodeStatus = {
-  node: string; isLeader: boolean; leaderID: string; term: number; epoch: number; handoffEpoch: number;
-  voters: string[]; healthy: boolean; owned: string[]; owners: Record<string, string>; handoffs?: Handoff[];
-};
-
-async function fetchNode(url: string): Promise<{ url: string; s?: NodeStatus; err?: string }> {
-  try {
-    const r = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(3000) });
-    if (!r.ok) return { url, err: `HTTP ${r.status}` };
-    return { url, s: await r.json() };
-  } catch (e) {
-    return { url, err: String(e) };
-  }
-}
-
-const QUERIES: Record<string, string> = {
-  "Unowned targets": "max(distriscrape_unowned_targets)",
-  "Ring rebalances": "sum(distriscrape_ring_rebalances_total)",
-  "Webhook failures": "sum(distriscrape_webhook_failures_total)",
-  "Release p95 (s)": "histogram_quantile(0.95, sum by (le) (rate(distriscrape_release_to_webhook_seconds_bucket[5m])))",
-};
-
-async function prom(base: string, q: string): Promise<string> {
-  try {
-    const r = await fetch(`${base}/api/v1/query?query=${encodeURIComponent(q)}`, { cache: "no-store", signal: AbortSignal.timeout(3000) });
-    const v = (await r.json()).data?.result?.[0]?.value?.[1];
-    return v === undefined || v === "NaN" ? "-" : String(Math.round(Number(v) * 1000) / 1000);
-  } catch {
-    return "n/a";
-  }
-}
 
 export default async function Page() {
   const promURL = process.env.PROMETHEUS_URL;
   const stats = promURL
     ? await Promise.all(Object.entries(QUERIES).map(async ([k, q]) => [k, await prom(promURL, q)] as const))
     : [];
-  const urls = (process.env.WORKER_STATUS_URLS ?? "").split(",").map((u) => u.trim()).filter(Boolean);
-  const nodes = await Promise.all(urls.map(fetchNode));
-  const leader = nodes.find((n) => n.s?.isLeader)?.s;
+  const urls = parseUrls(process.env.WORKER_STATUS_URLS);
+  const nodes = await Promise.all(urls.map((u) => fetchNode(u)));
+  const leader = pickLeader(nodes);
   const owners = Object.entries(leader?.owners ?? {}).sort();
 
   return (

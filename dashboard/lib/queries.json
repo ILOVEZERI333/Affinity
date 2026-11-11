@@ -1,0 +1,6 @@
+{
+  "Unowned targets": "max(distriscrape_unowned_targets)",
+  "Ring rebalances": "sum(distriscrape_ring_rebalances_total)",
+  "Webhook failures": "sum(distriscrape_webhook_failures_total)",
+  "Release p95 (s)": "histogram_quantile(0.95, sum by (le) (rate(distriscrape_release_to_webhook_seconds_bucket[5m])))"
+}

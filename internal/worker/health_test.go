@@ -3,12 +3,13 @@ package worker
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/affinity/distriscrape/internal/metrics"
-	"net/http"
-	"net/http/httptest"
-	"testing"
 )
 
 func TestLivenessHandler(t *testing.T) {
@@ -53,4 +54,31 @@ func TestReadyzFollowsReadiness(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ready = %d, want 200", rec.Code)
 	}
+}
+
+func TestProberRecoversAfterSuccess(t *testing.T) {
+	var failing atomic.Bool
+	failing.Store(true)
+	p := NewProber(func(context.Context) error {
+		if failing.Load() {
+			return errors.New("down")
+		}
+		return nil
+	}, metrics.New("c", "n"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Run(ctx, time.Millisecond)
+
+	wait := func(want bool, why string) {
+		deadline := time.Now().Add(2 * time.Second)
+		for p.Healthy() != want && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if p.Healthy() != want {
+			t.Fatal(why)
+		}
+	}
+	wait(false, "never became unhealthy")
+	failing.Store(false)
+	wait(true, "did not recover after a passing check")
 }
