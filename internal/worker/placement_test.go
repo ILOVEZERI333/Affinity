@@ -242,9 +242,12 @@ func TestReconcilePrunesHandoffsForDepartedNodes(t *testing.T) {
 // /status must not leak the peer URL that transport errors embed.
 func TestPushToRecordsCoarseError(t *testing.T) {
 	p := &Placer{pushed: map[string]pushedState{}, handoffs: map[string]HandoffRecord{}}
-	for _, tc := range []struct{ err, want error }{
-		{fmt.Errorf(`Post "http://10.0.0.7:8080/handoff": dial tcp: refused`), nil},
-		{ErrStaleEpoch, ErrStaleEpoch},
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf(`Post "http://10.0.0.7:8080/handoff": dial tcp: refused`), ""},
+		{ErrStaleEpoch, "stale epoch"},
 	} {
 		p.push = func(context.Context, string, handoffRequest) error { return tc.err }
 		if p.pushTo(context.Background(), "w-1", "10.0.0.7:7000", 1, nil) {
@@ -254,7 +257,7 @@ func TestPushToRecordsCoarseError(t *testing.T) {
 		if strings.Contains(got, "10.0.0.7") {
 			t.Fatalf("error leaks peer address: %q", got)
 		}
-		if tc.want != nil && got != tc.want.Error() {
+		if tc.want != "" && got != tc.want {
 			t.Fatalf("got %q, want %q", got, tc.want)
 		}
 	}
