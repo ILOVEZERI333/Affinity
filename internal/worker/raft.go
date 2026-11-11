@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -303,6 +304,14 @@ func (n *RaftNode) Epoch() uint64 {
 
 // Owners returns the replicated target -> confirmed owner map.
 func (n *RaftNode) Owners() map[string]string { return n.fsm.Owners() }
+
+// OwnerNodes returns the node IDs holding a committed ownership record, so the
+// leader can clear records for nodes that left the ring even after a failover.
+func (n *RaftNode) OwnerNodes() []string {
+	n.fsm.mu.RLock()
+	defer n.fsm.mu.RUnlock()
+	return slices.Collect(maps.Keys(n.fsm.owners))
+}
 
 // CommitAssignment records, through the log, that node confirmed owning targets
 // at epoch. Only the leader may call it.

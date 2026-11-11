@@ -131,6 +131,9 @@ func desiredStatefulSet(scraper *infrav1.DistributedScraper) *appsv1.StatefulSet
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:    &scraper.Spec.WorkerNodes,
 			ServiceName: name,
+			// Workers must start without waiting for pod -0 to be Ready, or a
+			// Raft cluster that lost quorum can never recover.
+			PodManagementPolicy: appsv1.ParallelPodManagement,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: podLabels,
 			},
