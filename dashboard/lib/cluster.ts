@@ -17,11 +17,25 @@ export function parseUrls(raw: string | undefined): string[] {
   return (raw ?? "").split(",").map((u) => u.trim()).filter(Boolean);
 }
 
+// Only what rendering and leader selection dereference; extra fields pass through.
+function isNodeStatus(v: unknown): v is NodeStatus {
+  const s = v as Partial<NodeStatus> | null;
+  return (
+    typeof s === "object" && s !== null &&
+    typeof s.node === "string" && typeof s.isLeader === "boolean" && typeof s.healthy === "boolean" &&
+    typeof s.term === "number" && typeof s.epoch === "number" &&
+    Array.isArray(s.owned) &&
+    (s.owners === undefined || (typeof s.owners === "object" && s.owners !== null)) &&
+    (s.handoffs === undefined || Array.isArray(s.handoffs))
+  );
+}
+
 export async function fetchNode(url: string, f: Fetch = fetch): Promise<NodeResult> {
   try {
     const r = await f(url, { cache: "no-store", signal: AbortSignal.timeout(3000) });
     if (!r.ok) return { url, err: `HTTP ${r.status}` };
-    return { url, s: await r.json() };
+    const body: unknown = await r.json();
+    return isNodeStatus(body) ? { url, s: body } : { url, err: "malformed status response" };
   } catch (e) {
     return { url, err: String(e) };
   }

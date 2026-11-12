@@ -39,6 +39,11 @@ describe("fetchNode", () => {
   it("turns a non-2xx into an error row", async () => {
     expect(await fetchNode("u", resp({}, { ok: false, status: 503 }))).toEqual({ url: "u", err: "HTTP 503" });
   });
+  it("turns a malformed body into an error row", async () => {
+    for (const body of [null, {}, { ...fixture, owned: null }, { ...fixture, handoffs: {} }]) {
+      expect(await fetchNode("u", resp(body))).toEqual({ url: "u", err: "malformed status response" });
+    }
+  });
   it("turns a network failure into an error row", async () => {
     const r = await fetchNode("u", boom);
     expect(r.s).toBeUndefined();

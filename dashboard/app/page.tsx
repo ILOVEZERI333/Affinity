@@ -5,11 +5,13 @@ export const dynamic = "force-dynamic";
 
 export default async function Page() {
   const promURL = process.env.PROMETHEUS_URL;
-  const stats = promURL
-    ? await Promise.all(Object.entries(QUERIES).map(async ([k, q]) => [k, await prom(promURL, q)] as const))
-    : [];
   const urls = parseUrls(process.env.WORKER_STATUS_URLS);
-  const nodes = await Promise.all(urls.map((u) => fetchNode(u)));
+  // Start both groups before awaiting either so a slow Prometheus can't delay worker status.
+  const statsP = promURL
+    ? Promise.all(Object.entries(QUERIES).map(async ([k, q]) => [k, await prom(promURL, q)] as const))
+    : Promise.resolve([]);
+  const nodesP = Promise.all(urls.map((u) => fetchNode(u)));
+  const [stats, nodes] = await Promise.all([statsP, nodesP]);
   const leader = pickLeader(nodes);
   const owners = Object.entries(leader?.owners ?? {}).sort();
 
