@@ -90,7 +90,8 @@ func (s *Server) Epoch() uint64 {
 func (s *Server) Owned() []string {
 	s.handoffMu.Lock()
 	defer s.handoffMu.Unlock()
-	return append([]string(nil), s.owned...)
+	// Non-nil so /status serves [] rather than null before the first handoff.
+	return append(make([]string, 0, len(s.owned)), s.owned...)
 }
 
 // NewServer constructs a peer server backed by the given Raft node and hash
