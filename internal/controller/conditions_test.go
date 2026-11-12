@@ -41,6 +41,10 @@ func TestComputeConditions(t *testing.T) {
 			metav1.ConditionTrue, metav1.ConditionFalse, metav1.ConditionTrue},
 		{"minority healthy", []*worker.NodeStatus{ns("w-0", "w-0", true, all), ns("w-1", "w-0", false, all), ns("w-2", "w-0", false, all)},
 			metav1.ConditionTrue, metav1.ConditionTrue, metav1.ConditionFalse},
+		{"unreachable nodes do not break the vote", []*worker.NodeStatus{ns("w-0", "w-0", true, all), ns("w-1", "w-0", true, all), nil},
+			metav1.ConditionTrue, metav1.ConditionTrue, metav1.ConditionTrue},
+		{"split vote has no leader", []*worker.NodeStatus{ns("w-0", "w-0", true, all), ns("w-1", "w-1", true, all), ns("w-2", "w-2", true, all)},
+			metav1.ConditionFalse, metav1.ConditionFalse, metav1.ConditionFalse},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -52,5 +56,12 @@ func TestComputeConditions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestComputeConditionsZeroWorkers(t *testing.T) {
+	conds, leader := computeConditions(nil, 0, []*worker.NodeStatus{ns("w-0", "w-0", true, nil)})
+	if leader != "" || status(conds, ConditionLeaderElected) != metav1.ConditionFalse {
+		t.Fatalf("workers=0 must not elect a leader: leader=%q conds=%v", leader, conds)
 	}
 }

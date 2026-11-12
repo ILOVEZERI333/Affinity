@@ -1,0 +1,15 @@
+{
+  "node": "w-0",
+  "isLeader": true,
+  "leaderID": "w-0",
+  "term": 3,
+  "epoch": 5,
+  "handoffEpoch": 5,
+  "voters": ["w-0", "w-1", "w-2"],
+  "healthy": true,
+  "owned": ["a"],
+  "owners": { "a": "w-0", "b": "w-1" },
+  "handoffs": [
+    { "node": "w-1", "epoch": 5, "targets": 1, "sentAt": "2026-01-01T00:00:00Z", "acked": false, "error": "handoff failed" }
+  ]
+}

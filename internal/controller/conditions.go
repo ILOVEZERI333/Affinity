@@ -60,7 +60,7 @@ func computeConditions(targets []string, workers int32, statuses []*worker.NodeS
 			best, bestVotes = id, n
 		}
 	}
-	elected := bestVotes*3 >= int(workers)*2
+	elected := workers > 0 && best != "" && bestVotes*3 >= int(workers)*2
 	leaderExists := best != "" && bestVotes > 0
 
 	le := cond(ConditionLeaderElected, "NoQuorumOnLeader", fmt.Sprintf("%d of %d workers agree on a leader, need two thirds", bestVotes, workers), metav1.ConditionFalse)
