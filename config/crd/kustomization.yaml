@@ -1,2 +1,2 @@
-# Placeholder for Kubebuilder-generated CRD manifests.
-# TODO: Populate via `make manifests` / controller-gen.
+resources:
+  - infra.tony_distributedscrapers.yaml

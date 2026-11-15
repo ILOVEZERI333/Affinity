@@ -80,4 +80,34 @@ make test
 make docker-build   # operator + worker images
 ```
 
-Apply a `DistributedScraper` once the operator is running in-cluster; the reconciler will stand up the worker StatefulSet and related resources from `spec`.
+### Run it locally on kind
+
+Requires `docker`, `kubectl` and `kind`.
+
+```bash
+make docker-build
+
+kind create cluster --name affinity
+kind load docker-image distriscrape-operator:latest distriscrape-worker:latest --name affinity
+
+# CRD, RBAC, then the operator Deployment (all in the default namespace)
+kubectl apply -k config/crd
+kubectl apply -k config/rbac
+kubectl apply -k config/manager
+kubectl rollout status deploy/affinity-operator
+
+# Declare what to track; the operator creates the worker StatefulSet, Service and ConfigMap
+kubectl apply -f examples/manhwa-tracker.yaml
+kubectl get distributedscraper,sts,pods
+
+# Scale
+kubectl patch distributedscraper manhwa-tracker --type merge -p '{"spec":{"workerNodes":5}}'
+
+kind delete cluster --name affinity   # clean up
+```
+
+The example's `webhookDestination` is a placeholder and no chapter source is configured, so workers will log `poll failed` until you set a real webhook and `SOURCE_URL`. The CRD and RBAC manifests in `config/` are generated with controller-gen from the markers in `api/` and `internal/controller/`.
+
+### Run workers without Kubernetes
+
+Workers are plain processes configured by env vars (`NODE_ID`, `BIND_ADDR`, `API_BIND_ADDR`, `HEALTH_ADDR`, `PEER_ADDRS`, `DATA_DIR`, `TARGETS_FILE`, `SOURCE_URL`, `WEBHOOK_URL`, `BOOTSTRAP`). Start one with `BOOTSTRAP=true` and point the rest at it via `PEER_ADDRS`. `SOURCE_URL` must return a JSON array of `{"number", "title", "url"}`, with `{target}` substituted per series.
