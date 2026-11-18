@@ -112,6 +112,7 @@ func (r *DistributedScraperReconciler) nextPoll(key string, reached bool) time.D
 }
 
 // +kubebuilder:rbac:groups=infra.tony,resources=distributedscrapers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=infra.tony,resources=distributedscrapers/finalizers,verbs=update
 // +kubebuilder:rbac:groups=infra.tony,resources=distributedscrapers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services;configmaps,verbs=get;list;watch;create;update;patch;delete

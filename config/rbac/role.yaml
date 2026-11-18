@@ -44,6 +44,12 @@ rules:
 - apiGroups:
   - infra.tony
   resources:
+  - distributedscrapers/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - infra.tony
+  resources:
   - distributedscrapers/status
   verbs:
   - get

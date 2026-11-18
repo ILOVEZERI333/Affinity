@@ -106,8 +106,8 @@ kubectl patch distributedscraper manhwa-tracker --type merge -p '{"spec":{"worke
 kind delete cluster --name affinity   # clean up
 ```
 
-The example's `webhookDestination` is a placeholder and no chapter source is configured, so workers will log `poll failed` until you set a real webhook and `SOURCE_URL`. The CRD and RBAC manifests in `config/` are generated with controller-gen from the markers in `api/` and `internal/controller/`.
+The example's `webhookDestination` is a placeholder and no chapter source is configured, so workers will log `poll failed`. The operator-managed worker template has no supported way to set `SOURCE_URL`, so setting `webhookDestination` alone will not enable polling, and hand-editing the StatefulSet is overwritten on the next reconcile. The CRD and RBAC manifests in `config/` are generated with controller-gen from the markers in `api/` and `internal/controller/`.
 
 ### Run workers without Kubernetes
 
-Workers are plain processes configured by env vars (`NODE_ID`, `BIND_ADDR`, `API_BIND_ADDR`, `HEALTH_ADDR`, `PEER_ADDRS`, `DATA_DIR`, `TARGETS_FILE`, `SOURCE_URL`, `WEBHOOK_URL`, `BOOTSTRAP`). Start one with `BOOTSTRAP=true` and point the rest at it via `PEER_ADDRS`. `SOURCE_URL` must return a JSON array of `{"number", "title", "url"}`, with `{target}` substituted per series.
+Workers are plain processes configured by env vars (`NODE_ID`, `BIND_ADDR`, `API_BIND_ADDR`, `HEALTH_ADDR`, `PEER_ADDRS`, `DATA_DIR`, `TARGETS_FILE`, `SOURCE_URL`, `WEBHOOK_URL`, `BOOTSTRAP`). Start one with `BOOTSTRAP=true` and point the rest at it via `PEER_ADDRS`. When workers run on different hosts, set `ADVERTISE_ADDR` on each to an address the other hosts can reach. Workers sharing a host need unique `BIND_ADDR`, `API_BIND_ADDR`, `HEALTH_ADDR` and `DATA_DIR` values to avoid listener conflicts and shared state. `SOURCE_URL` must return a JSON array of `{"number", "title", "url"}`, with `{target}` substituted per series.
