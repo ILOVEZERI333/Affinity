@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: affinity-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: affinity-operator}
+  template:
+    metadata:
+      labels: {app: affinity-operator}
+    spec:
+      serviceAccountName: affinity-operator
+      containers:
+        - name: operator
+          image: distriscrape-operator:latest
+          imagePullPolicy: IfNotPresent
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8081}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8081}

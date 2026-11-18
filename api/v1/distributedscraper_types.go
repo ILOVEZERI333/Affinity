@@ -65,7 +65,7 @@ type DistributedScraper struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   DistributedScraperSpec   `json:"spec,omitempty"`
+	Spec   DistributedScraperSpec   `json:"spec"`
 	Status DistributedScraperStatus `json:"status,omitempty"`
 }
 

@@ -80,4 +80,41 @@ make test
 make docker-build   # operator + worker images
 ```
 
-Apply a `DistributedScraper` once the operator is running in-cluster; the reconciler will stand up the worker StatefulSet and related resources from `spec`.
+### Run it locally on kind
+
+Requires `docker`, `kubectl` and `kind`.
+
+```bash
+make docker-build
+
+kind create cluster --name affinity
+kind load docker-image distriscrape-operator:latest distriscrape-worker:latest --name affinity
+
+# CRD, RBAC, then the operator Deployment (all in the default namespace)
+kubectl apply -k config/crd
+kubectl apply -k config/rbac
+kubectl apply -k config/manager
+kubectl rollout status deploy/affinity-operator
+
+# Declare what to track; the operator creates the worker StatefulSet, Service and ConfigMap
+kubectl apply -f examples/manhwa-tracker.yaml
+kubectl get distributedscraper,sts,pods
+
+# Scale
+kubectl patch distributedscraper manhwa-tracker --type merge -p '{"spec":{"workerNodes":5}}'
+
+kind delete cluster --name affinity   # clean up
+```
+
+The example's `webhookDestination` is a placeholder and no chapter source is configured, so workers will log `poll failed`. The operator-managed worker template has no supported way to set `SOURCE_URL`, so setting `webhookDestination` alone will not enable polling, and hand-editing the StatefulSet is overwritten on the next reconcile. The CRD and RBAC manifests in `config/` are generated with controller-gen from the markers in `api/` and `internal/controller/`.
+
+### Run workers without Kubernetes
+
+Workers are plain processes configured by env vars (`NODE_ID`, `BIND_ADDR`, `API_BIND_ADDR`, `HEALTH_ADDR`, `PEER_ADDRS`, `DATA_DIR`, `TARGETS_FILE`, `SOURCE_URL`, `WEBHOOK_URL`, `BOOTSTRAP`). Start one with `BOOTSTRAP=true` and point the rest at it via `PEER_ADDRS`. When workers run on different hosts, set `ADVERTISE_ADDR` on each to an address the other hosts can reach. Every worker needs a unique, stable `NODE_ID` (or `POD_NAME`), including workers sharing a host. Workers sharing a host also need unique `BIND_ADDR`, `API_BIND_ADDR`, `HEALTH_ADDR` and `DATA_DIR` values to avoid listener conflicts and shared state. Peers derive a worker's API address from its advertised Raft address, so each `API_BIND_ADDR` port must be exactly one greater than that worker's Raft port.
+
+`SOURCE_URL` must return a JSON array of chapter objects, with `{target}` substituted per series. `number` may be a JSON number or a string; entries whose number is not numeric are skipped. `title` and `url` must be strings, and any other type fails the whole response.
+
+```json
+[{"number": 12.5, "title": "Chapter 12.5", "url": "https://example.com/solo-leveling/12.5"},
+ {"number": "13", "title": "Chapter 13", "url": "https://example.com/solo-leveling/13"}]
+```
