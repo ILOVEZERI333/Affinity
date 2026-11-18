@@ -110,4 +110,11 @@ The example's `webhookDestination` is a placeholder and no chapter source is con
 
 ### Run workers without Kubernetes
 
-Workers are plain processes configured by env vars (`NODE_ID`, `BIND_ADDR`, `API_BIND_ADDR`, `HEALTH_ADDR`, `PEER_ADDRS`, `DATA_DIR`, `TARGETS_FILE`, `SOURCE_URL`, `WEBHOOK_URL`, `BOOTSTRAP`). Start one with `BOOTSTRAP=true` and point the rest at it via `PEER_ADDRS`. When workers run on different hosts, set `ADVERTISE_ADDR` on each to an address the other hosts can reach. Workers sharing a host need unique `BIND_ADDR`, `API_BIND_ADDR`, `HEALTH_ADDR` and `DATA_DIR` values to avoid listener conflicts and shared state. `SOURCE_URL` must return a JSON array of `{"number", "title", "url"}`, with `{target}` substituted per series.
+Workers are plain processes configured by env vars (`NODE_ID`, `BIND_ADDR`, `API_BIND_ADDR`, `HEALTH_ADDR`, `PEER_ADDRS`, `DATA_DIR`, `TARGETS_FILE`, `SOURCE_URL`, `WEBHOOK_URL`, `BOOTSTRAP`). Start one with `BOOTSTRAP=true` and point the rest at it via `PEER_ADDRS`. When workers run on different hosts, set `ADVERTISE_ADDR` on each to an address the other hosts can reach. Every worker needs a unique, stable `NODE_ID` (or `POD_NAME`), including workers sharing a host. Workers sharing a host also need unique `BIND_ADDR`, `API_BIND_ADDR`, `HEALTH_ADDR` and `DATA_DIR` values to avoid listener conflicts and shared state. Peers derive a worker's API address from its advertised Raft address, so each `API_BIND_ADDR` port must be exactly one greater than that worker's Raft port.
+
+`SOURCE_URL` must return a JSON array of chapter objects, with `{target}` substituted per series. `number` may be a JSON number or a string; entries whose number is not numeric are skipped. `title` and `url` must be strings, and any other type fails the whole response.
+
+```json
+[{"number": 12.5, "title": "Chapter 12.5", "url": "https://example.com/solo-leveling/12.5"},
+ {"number": "13", "title": "Chapter 13", "url": "https://example.com/solo-leveling/13"}]
+```
